@@ -214,6 +214,11 @@ const CloudSync = {
         return; 
       }
       
+      // Track changes for notification
+      let hasChanges = false;
+      const oldEmployeeCount = DB.employees.length;
+      const oldTransactionCount = DB.transactions.length;
+      
       // Normalize data types from Google Sheets (numbers to strings, etc.)
       if (data.employees) {
         data.employees = data.employees.map(e => ({
@@ -226,7 +231,10 @@ const CloudSync = {
           phone: String(e.phone || ''),
           notes: String(e.notes || '')
         }));
+        DB.saveEmployees(data.employees);
+        if (data.employees.length !== oldEmployeeCount) hasChanges = true;
       }
+      
       if (data.transactions) {
         data.transactions = data.transactions.map(t => ({
           ...t,
