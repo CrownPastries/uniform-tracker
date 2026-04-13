@@ -479,6 +479,37 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Start automatic cloud sync if configured
   startAutoSync();
+  
+  // Handle window resize for sidebar responsiveness
+  window.addEventListener('resize', () => {
+    const sidebar = document.getElementById('sidebar');
+    const main = document.querySelector('.main-content');
+    const backdrop = document.getElementById('sidebar-backdrop');
+    
+    if (window.innerWidth > 768) {
+      // Switched to desktop - hide backdrop, use width-based layout
+      if (backdrop) backdrop.style.display = 'none';
+      sidebar.classList.remove('open');
+      if (sidebarOpen) {
+        sidebar.classList.remove('closed');
+        main.classList.remove('expanded');
+      } else {
+        sidebar.classList.add('closed');
+        main.classList.add('expanded');
+      }
+    } else {
+      // Switched to mobile - use transform-based layout
+      sidebar.classList.remove('closed');
+      main.classList.remove('expanded');
+      if (sidebarOpen) {
+        sidebar.classList.add('open');
+        if (backdrop) backdrop.style.display = 'block';
+      } else {
+        sidebar.classList.remove('open');
+        if (backdrop) backdrop.style.display = 'none';
+      }
+    }
+  });
 });
 
 // ============================================================
@@ -520,14 +551,102 @@ function handleLogout() {
 window.handleLogout = handleLogout;
 
 // ============================================================
-// SIDEBAR & NAVIGATION
+// ROLE-BASED PERMISSIONS
 // ============================================================
+const ROLE_PERMISSIONS = {
+  admin: {
+    actions: ['received_from_cintas', 'distributed', 'reported_issue', 'returned', 'sent_to_cintas'],
+    canManageUsers: true,
+    canDeleteTransactions: true,
+    canExportData: true
+  },
+  warehouse: {
+    actions: ['received_from_cintas', 'returned', 'sent_to_cintas'],
+    canManageUsers: false,
+    canDeleteTransactions: false,
+    canExportData: true
+  },
+  sasoon: {
+    actions: ['received_from_cintas', 'sent_to_cintas'],
+    canManageUsers: false,
+    canDeleteTransactions: false,
+    canExportData: false
+  },
+  operator: {
+    actions: ['distributed', 'reported_issue', 'returned'],
+    canManageUsers: false,
+    canDeleteTransactions: false,
+    canExportData: false
+  }
+};
+
+function hasPermission(action) {
+  if (!currentUser) return false;
+  const permissions = ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator;
+  return permissions.actions.includes(action);
+}
+
+function canManageUsers() {
+  if (!currentUser) return false;
+  const permissions = ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator;
+  return permissions.canManageUsers;
+}
+
+function canDeleteTransactions() {
+  if (!currentUser) return false;
+  const permissions = ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator;
+  return permissions.canDeleteTransactions;
+}
+
+function updateActionTabsVisibility() {
+  if (!currentUser) return;
+  
+  const permissions = ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator;
+  const allowedActions = permissions.actions;
+  
+  // Hide/show action tabs
+  document.querySelectorAll('.action-tab').forEach(tab => {
+    const action = tab.id.replace('tab-', '');
+    if (allowedActions.includes(action)) {
+      tab.style.display = 'flex';
+    } else {
+      tab.style.display = 'none';
+    }
+  });
+  
+  // If current action is not allowed, switch to first allowed action
+  if (!hasPermission(currentAction)) {
+    const firstAllowed = allowedActions[0];
+    if (firstAllowed) {
+      setAction(firstAllowed);
+    }
+  }
+}
 function toggleSidebar() {
   sidebarOpen = !sidebarOpen;
   const sidebar = document.getElementById('sidebar');
   const main    = document.querySelector('.main-content');
-  if (sidebarOpen) { sidebar.classList.remove('closed'); main.classList.remove('expanded'); }
-  else             { sidebar.classList.add('closed');    main.classList.add('expanded');    }
+  const backdrop = document.getElementById('sidebar-backdrop');
+  
+  if (window.innerWidth <= 768) {
+    // Mobile: use transform and backdrop
+    if (sidebarOpen) {
+      sidebar.classList.add('open');
+      if (backdrop) backdrop.style.display = 'block';
+    } else {
+      sidebar.classList.remove('open');
+      if (backdrop) backdrop.style.display = 'none';
+    }
+  } else {
+    // Desktop: use width changes
+    if (sidebarOpen) { 
+      sidebar.classList.remove('closed'); 
+      main.classList.remove('expanded'); 
+    } else { 
+      sidebar.classList.add('closed');    
+      main.classList.add('expanded');    
+    }
+  }
 }
 
 function showPage(page) {
@@ -541,7 +660,10 @@ function showPage(page) {
   const titles = {dashboard:'Dashboard',employees:'Employees',scan:'Scan Entry',reports:'Reports',settings:'Settings'};
   document.getElementById('pageTitle').textContent = titles[page] || page;
   // Start/stop scanner focus lock
-  if (page === 'scan') startFocusLock();
+  if (page === 'scan') {
+    updateActionTabsVisibility();
+    startFocusLock();
+  }
   else                 stopFocusLock();
 
   if (page === 'dashboard') renderDashboard();
@@ -735,6 +857,12 @@ function showEmployeeDetail(id) {
 // SCAN ENTRY
 // ============================================================
 function setAction(action) {
+  // Check permissions
+  if (!hasPermission(action)) {
+    showToast(`Access denied. Your role cannot perform "${actionLabel(action)}" actions.`, 'error');
+    return;
+  }
+
   currentAction = action;
   document.querySelectorAll('.action-tab').forEach(t => t.classList.remove('active'));
   const tab = document.getElementById('tab-' + action);
@@ -1224,28 +1352,148 @@ function renderReport() {
         </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:30px">No uniforms currently in warehouse.</td></tr>'}</tbody>
       </table></div>`;
 
+  // ---- ACTIVITY SUMMARY ----
+  } else if (currentReport === 'activity-summary') {
+    const filteredTxns = txns.filter(t => inRange(t.date));
+    const stats = {
+      totalScans: filteredTxns.length,
+      uniqueBarcodes: new Set(filteredTxns.map(t => t.barcode)).size,
+      uniqueEmployees: new Set(filteredTxns.filter(t => t.employeeId).map(t => t.employeeId)).size,
+      byAction: {},
+      byDate: {},
+      byEmployee: {},
+      byCentre: {}
+    };
+
+    // Group by action
+    filteredTxns.forEach(t => {
+      stats.byAction[t.action] = (stats.byAction[t.action] || 0) + 1;
+    });
+
+    // Group by date
+    filteredTxns.forEach(t => {
+      const date = t.date;
+      stats.byDate[date] = (stats.byDate[date] || 0) + 1;
+    });
+
+    // Group by employee
+    filteredTxns.filter(t => t.employeeId).forEach(t => {
+      const emp = employees.find(e => e.id === t.employeeId);
+      const name = emp ? `${emp.firstName} ${emp.lastName}` : 'Unknown';
+      stats.byEmployee[name] = (stats.byEmployee[name] || 0) + 1;
+    });
+
+    // Group by centre
+    filteredTxns.filter(t => t.employeeId).forEach(t => {
+      const emp = employees.find(e => e.id === t.employeeId);
+      const centre = emp?.productionCentre || 'Unknown';
+      stats.byCentre[centre] = (stats.byCentre[centre] || 0) + 1;
+    });
+
+    const topEmployees = Object.entries(stats.byEmployee).sort((a,b) => b[1] - a[1]).slice(0, 10);
+    const topCentres = Object.entries(stats.byCentre).sort((a,b) => b[1] - a[1]).slice(0, 10);
+    const dailyActivity = Object.entries(stats.byDate).sort((a,b) => a[0].localeCompare(b[0]));
+
+    container.innerHTML = `
+      <div class="report-summary" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr))">
+        <div class="rs-card"><div class="rs-num" style="color:var(--blue)">${stats.totalScans}</div><div class="rs-label">Total Scans</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--green)">${stats.uniqueBarcodes}</div><div class="rs-label">Unique Barcodes</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--orange)">${stats.uniqueEmployees}</div><div class="rs-label">Active Employees</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--purple)">${Object.keys(stats.byAction).length}</div><div class="rs-label">Action Types</div></div>
+      </div>
+
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin:20px 0">
+        <div class="card">
+          <div class="card-header"><h3 class="card-title">Scans by Action</h3></div>
+          <div class="report-table-wrap" style="max-height:300px">
+            <table class="report-table">
+              <thead><tr><th>Action</th><th>Count</th><th>%</th></tr></thead>
+              <tbody>${Object.entries(stats.byAction).sort((a,b) => b[1] - a[1]).map(([action, count]) => `
+                <tr>
+                  <td><span class="report-badge ${action==='distributed'?'out':action==='returned'?'returned':action==='reported_issue'?'issue':action==='sent_to_cintas'?'cintas':'warehouse'}">${actionLabel(action)}</span></td>
+                  <td>${count}</td>
+                  <td>${((count/stats.totalScans)*100).toFixed(1)}%</td>
+                </tr>
+              `).join('')}</tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><h3 class="card-title">Top Employees</h3></div>
+          <div class="report-table-wrap" style="max-height:300px">
+            <table class="report-table">
+              <thead><tr><th>Employee</th><th>Scans</th></tr></thead>
+              <tbody>${topEmployees.map(([name, count]) => `
+                <tr>
+                  <td>${escHtml(name)}</td>
+                  <td>${count}</td>
+                </tr>
+              `).join('')}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin:20px 0">
+        <div class="card">
+          <div class="card-header"><h3 class="card-title">By Production Centre</h3></div>
+          <div class="report-table-wrap" style="max-height:300px">
+            <table class="report-table">
+              <thead><tr><th>Centre</th><th>Scans</th></tr></thead>
+              <tbody>${topCentres.map(([centre, count]) => `
+                <tr>
+                  <td>${escHtml(centre)}</td>
+                  <td>${count}</td>
+                </tr>
+              `).join('')}</tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><h3 class="card-title">Daily Activity</h3></div>
+          <div class="report-table-wrap" style="max-height:300px">
+            <table class="report-table">
+              <thead><tr><th>Date</th><th>Scans</th></tr></thead>
+              <tbody>${dailyActivity.slice(-14).map(([date, count]) => `
+                <tr>
+                  <td>${formatDate(date)}</td>
+                  <td>${count}</td>
+                </tr>
+              `).join('')}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+
   // ---- BARCODE TIMELINE ----
   } else if (currentReport === 'barcode-history') {
     let filteredTxns = txns.filter(t => inRange(t.date));
     if (q) filteredTxns = filteredTxns.filter(t => t.barcode.toLowerCase().includes(q) || (t.employeeName||'').toLowerCase().includes(q));
-    const canDelete = currentUser && currentUser.role === 'admin';
+    const canDelete = canDeleteTransactions();
     container.innerHTML = `
       <div class="report-table-wrap"><table class="report-table">
-        <thead><tr><th>Date</th><th>Barcode</th><th>Action</th><th>Employee / Location</th><th>Notes</th><th class="admin-only" style="${canDelete?'':'display:none'}">Action</th></tr></thead>
+        <thead><tr><th>Date</th><th>Barcode</th><th>Action</th><th>Employee / Location</th><th>Notes</th>${canDelete ? '<th>Action</th>' : ''}</tr></thead>
         <tbody>${filteredTxns.length ? filteredTxns.map(t => `<tr>
           <td>${formatDate(t.date)}</td>
           <td class="bc-mono">${escHtml(t.barcode)}</td>
           <td><span class="report-badge ${t.action==='distributed'?'out':t.action==='returned'?'returned':t.action==='reported_issue'?'issue':t.action==='sent_to_cintas'?'cintas':'warehouse'}">${actionLabel(t.action)}</span></td>
           <td>${escHtml(t.employeeName||(t.action==='reported_issue'?'Issue → Cintas':t.action.includes('cintas')?'Cintas':'Warehouse'))}</td>
           <td>${escHtml(t.notes||'')}</td>
-          <td class="admin-only" style="${canDelete?'':'display:none'}"><button class="btn-text" style="color:var(--red)" onclick="deleteTransaction('${t.id}')">Delete</button></td>
-        </tr>`).join('') : '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:30px">No transactions found.</td></tr>'}</tbody>
+          ${canDelete ? `<td><button class="btn-text" style="color:var(--red)" onclick="deleteTransaction('${t.id}')">Delete</button></td>` : ''}
+        </tr>`).join('') : '<tr><td colspan="' + (canDelete ? '6' : '5') + '" style="text-align:center;color:var(--text3);padding:30px">No transactions found.</td></tr>'}</tbody>
       </table></div>`;
   }
 }
 
 function deleteTransaction(id) {
-  if (!currentUser || currentUser.role !== 'admin') return;
+  if (!canDeleteTransactions()) {
+    showToast('Access denied. Your role cannot delete transactions.', 'error');
+    return;
+  }
+  
   confirm_dialog('Delete Transaction?', 'Are you sure you want to completely remove this barcode scan record from history? This cannot be undone.', () => {
     DB.removeTransaction(id);
     showToast('Transaction deleted.', 'success');
@@ -1264,6 +1512,11 @@ function clearDates() {
 // CSV EXPORT
 // ============================================================
 function exportCSV() {
+  if (!canExportData()) {
+    showToast('Access denied. Your role cannot export data.', 'error');
+    return;
+  }
+  
   const table = document.querySelector('#report-content .report-table');
   if (!table) { showToast('No data to export.', 'error'); return; }
   const rows    = [];
@@ -1294,14 +1547,14 @@ function renderSettings() {
   if (keyEl && !keyEl.value) keyEl.value = CloudSync.apiKey;
   updateSyncStatus();
   
-  if (currentUser && currentUser.role === 'admin') {
+  if (canManageUsers()) {
     const uBody = document.getElementById('users-tbody');
     if (uBody) {
       if (!DB.users.length) { uBody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--text3)">No users found.</td></tr>'; }
       else {
         uBody.innerHTML = DB.users.map(u => `<tr>
           <td><strong>${escHtml(u.username)}</strong></td>
-          <td>${u.role==='admin'?'<span style="color:var(--red);font-weight:600">Admin</span>':'Operator'}</td>
+          <td>${u.role==='admin'?'<span style="color:var(--red);font-weight:600">Admin</span>':u.role==='sasoon'?'<span style="color:var(--blue);font-weight:600">Sasoon</span>':u.role==='warehouse'?'<span style="color:var(--green);font-weight:600">Warehouse</span>':'Operator'}</td>
           <td style="text-align:right">
             <button class="btn-text" style="color:var(--red)" onclick="removeUser('${u.username}')">Remove</button>
           </td>
@@ -1313,7 +1566,7 @@ function renderSettings() {
 
 function addUser() {
   console.log("addUser called with currentUser:", currentUser);
-  if (!currentUser || currentUser.role !== 'admin') {
+  if (!canManageUsers()) {
     console.warn("addUser blocked: insufficient privileges or null session.");
     return;
   }
@@ -1332,7 +1585,7 @@ function addUser() {
 window.addUser = addUser;
 
 function removeUser(u) {
-  if (!currentUser || currentUser.role !== 'admin') return;
+  if (!canManageUsers()) return;
   if (u === currentUser.username) return showToast('Cannot delete yourself!', 'error');
   if (u === 'admin') return showToast('Cannot delete master admin account!', 'error');
   confirm_dialog('Remove user?', `Are you sure you want to remove access for user ${u}?`, () => {

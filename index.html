@@ -36,6 +36,9 @@
 
   <!-- App Wrapper (hidden until logged in) -->
   <div id="app-wrapper" style="display:none; height:100vh; flex-direction:column;">
+  <!-- Mobile Sidebar Backdrop -->
+  <div id="sidebar-backdrop" class="sidebar-backdrop" onclick="toggleSidebar()" style="display:none"></div>
+  
   <!-- Sidebar -->
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-header">
@@ -256,6 +259,7 @@
         <button class="report-tab" data-report="employee-summary" onclick="setReport('employee-summary')">By Employee</button>
         <button class="report-tab" data-report="cintas" onclick="setReport('cintas')">At Cintas</button>
         <button class="report-tab" data-report="warehouse" onclick="setReport('warehouse')">Warehouse</button>
+        <button class="report-tab" data-report="activity-summary" onclick="setReport('activity-summary')">📊 Activity Summary</button>
         <button class="report-tab" data-report="barcode-history" onclick="setReport('barcode-history')">Barcode History</button>
       </div>
       <div class="report-controls">
@@ -305,7 +309,12 @@
           <div class="tag-add-row" style="padding-top:0">
             <input type="text" id="new-user-name" class="field-input" placeholder="New Username" style="flex:1; min-width:100px" />
             <input type="password" id="new-user-pass" class="field-input" placeholder="Password" style="flex:1; min-width:100px" />
-            <select id="new-user-role" class="field-input" style="flex:0.6; min-width:80px"><option value="operator">Operator</option><option value="admin">Admin</option></select>
+            <select id="new-user-role" class="field-input" style="flex:0.6; min-width:80px">
+              <option value="operator">Operator</option>
+              <option value="sasoon">Sasoon</option>
+              <option value="warehouse">Warehouse</option>
+              <option value="admin">Admin</option>
+            </select>
             <button id="add-user-btn" class="btn-primary" onclick="window.addUser()">Add</button>
           </div>
         </div>
