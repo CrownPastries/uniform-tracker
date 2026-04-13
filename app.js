@@ -203,28 +203,83 @@ const CloudSync = {
       return; 
     }
     const btn = document.getElementById('cloud-pull-btn');
+    const syncNowBtn = document.getElementById('cloud-sync-now-btn');
     if (btn) { btn.disabled = true; btn.textContent = 'Pulling…'; }
+    if (syncNowBtn) { syncNowBtn.disabled = true; syncNowBtn.textContent = 'Syncing…'; }
+    
     try {
       const data = await this.get('getAll');
       if (!data || data.error) { 
         if (!silent) showToast('Pull failed: ' + (data?.error || 'No data'), 'error'); 
         return; 
       }
-      if (data.employees)    DB.saveEmployees(data.employees);
+      
+      // Track changes for notification
+      let hasChanges = false;
+      const oldEmployeeCount = DB.employees.length;
+      const oldTransactionCount = DB.transactions.length;
+      
+      // Update employees (simple replace)
+      if (data.employees) {
+        DB.saveEmployees(data.employees);
+        if (data.employees.length !== oldEmployeeCount) hasChanges = true;
+      }
+      
+      // Update config data
       if (data.centres && data.centres.length) DB.saveCentres(data.centres);
       if (data.uniformTypes && data.uniformTypes.length) DB.saveTypes(data.uniformTypes);
+      
+      // Update transactions more carefully
       if (data.transactions) {
+        // Create a map of existing transactions by ID for quick lookup
+        const existingTxns = new Map();
+        DB_MEMORY.transactions.forEach(t => existingTxns.set(t.id, t));
+        
+        // Merge transactions: keep local ones that aren't in cloud, update existing ones
+        const mergedTxns = [...DB_MEMORY.transactions]; // Start with local
+        
+        for (const cloudTxn of data.transactions) {
+          const existingIdx = mergedTxns.findIndex(t => t.id === cloudTxn.id);
+          if (existingIdx >= 0) {
+            // Check if data actually changed
+            const existing = mergedTxns[existingIdx];
+            if (JSON.stringify(existing) !== JSON.stringify(cloudTxn)) {
+              mergedTxns[existingIdx] = cloudTxn;
+              hasChanges = true;
+            }
+          } else {
+            // Add new transaction from cloud
+            mergedTxns.push(cloudTxn);
+            hasChanges = true;
+          }
+        }
+        
+        // Save merged transactions
+        DB_MEMORY.transactions = mergedTxns.sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
+        
+        // Update IndexedDB
         await IDB.clearTransactions();
-        DB_MEMORY.transactions = data.transactions;
-        for (const t of data.transactions) await IDB.saveTransaction(t);
+        for (const t of DB_MEMORY.transactions) await IDB.saveTransaction(t);
+        
+        if (data.transactions.length !== oldTransactionCount) hasChanges = true;
       }
+      
       localStorage.setItem('ut_last_sync', new Date().toISOString());
-      if (!silent) showToast('✓ Data pulled from Google Sheets!', 'success');
+      
+      // Show appropriate message
+      if (!silent) {
+        showToast('✓ Data synced from Google Sheets!', 'success');
+      } else if (hasChanges && silent) {
+        // Show subtle notification for automatic sync with changes
+        showToast('🔄 Data updated from other devices', 'info');
+      }
+      
       renderDashboard(); renderEmployeeList(); renderSettings();
     } catch (e) {
       if (!silent) showToast('Pull error: ' + e.message, 'error');
     } finally {
       if (btn) { btn.disabled = false; btn.textContent = 'Pull from Cloud'; }
+      if (syncNowBtn) { syncNowBtn.disabled = false; syncNowBtn.textContent = 'Sync Now'; }
       updateSyncStatus();
     }
   },
@@ -259,10 +314,33 @@ function updateSyncStatus() {
   const isAutoSync = autoSyncInterval && CloudSync.isReady();
   
   if (statusEl) {
-    const baseText = ts ? 'Last sync: ' + formatDateTime(ts) : 'Never synced';
-    statusEl.textContent = isAutoSync ? baseText + ' (Auto-sync active)' : baseText;
+    let statusText = '';
+    if (ts) {
+      const lastSync = new Date(ts);
+      const now = new Date();
+      const minutesAgo = Math.floor((now - lastSync) / (1000 * 60));
+      
+      if (minutesAgo < 1) {
+        statusText = 'Last sync: Just now';
+      } else if (minutesAgo < 60) {
+        statusText = `Last sync: ${minutesAgo}m ago`;
+      } else {
+        const hoursAgo = Math.floor(minutesAgo / 60);
+        statusText = `Last sync: ${hoursAgo}h ago`;
+      }
+    } else {
+      statusText = 'Never synced';
+    }
+    
+    if (isAutoSync) {
+      statusText += ' (Auto-sync active)';
+    }
+    
+    statusEl.textContent = statusText;
   }
-  if (dotEl)    dotEl.className = 'cloud-dot ' + (CloudSync.isReady() ? 'ready' : 'off');
+  if (dotEl) { 
+    dotEl.className = 'cloud-dot ' + (CloudSync.isReady() ? 'ready' : 'off');
+  }
 }
 
 function saveCloudConfig() {
@@ -280,9 +358,10 @@ function saveCloudConfig() {
 window.saveCloudConfig = saveCloudConfig;
 window.cloudSyncAll    = () => CloudSync.syncAll();
 window.cloudPullAll    = () => CloudSync.pullAll(false); // Manual pull, show toasts
+window.cloudSyncNow    = () => CloudSync.pullAll(false); // Immediate sync with feedback
 window.cloudTestConn   = () => CloudSync.testConnection();
 
-// Automatic sync every 5 minutes
+// Automatic sync every 2 minutes
 let autoSyncInterval;
 function startAutoSync() {
   // Clear any existing interval
@@ -291,22 +370,20 @@ function startAutoSync() {
   // Only start if cloud sync is configured
   if (!CloudSync.isReady()) return;
   
-  // Sync every 5 minutes (300,000 ms)
+  // Sync every 2 minutes (120,000 ms) - more frequent for better cross-device sync
   autoSyncInterval = setInterval(async () => {
     try {
-      // Only auto-sync if the app is visible (not in background tab)
-      if (document.hidden) return;
-      
+      // Always sync, even in background tabs (removed document.hidden check)
       console.log('Auto-syncing with Google Sheets...');
       await CloudSync.pullAll(true); // Silent auto-sync
-      // Don't show toast for automatic syncs to avoid spam
+      console.log('Auto-sync completed successfully');
     } catch (e) {
       console.warn('Auto-sync failed:', e.message);
-      // Don't show error toast for automatic syncs
+      // Don't show error toast for automatic syncs to avoid spam
     }
-  }, 5 * 60 * 1000); // 5 minutes
+  }, 2 * 60 * 1000); // 2 minutes
   
-  console.log('Automatic cloud sync started (every 5 minutes)');
+  console.log('Automatic cloud sync started (every 2 minutes)');
   updateSyncStatus(); // Update status to show auto-sync is active
 }
 
