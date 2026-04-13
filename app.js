@@ -197,13 +197,19 @@ const CloudSync = {
     }
   },
 
-  async pullAll() {
-    if (!this.isReady()) { showToast('Cloud sync not configured. Go to Settings → Cloud Sync.', 'error'); return; }
+  async pullAll(silent = false) {
+    if (!this.isReady()) { 
+      if (!silent) showToast('Cloud sync not configured. Go to Settings → Cloud Sync.', 'error'); 
+      return; 
+    }
     const btn = document.getElementById('cloud-pull-btn');
     if (btn) { btn.disabled = true; btn.textContent = 'Pulling…'; }
     try {
       const data = await this.get('getAll');
-      if (!data || data.error) { showToast('Pull failed: ' + (data?.error || 'No data'), 'error'); return; }
+      if (!data || data.error) { 
+        if (!silent) showToast('Pull failed: ' + (data?.error || 'No data'), 'error'); 
+        return; 
+      }
       if (data.employees)    DB.saveEmployees(data.employees);
       if (data.centres && data.centres.length) DB.saveCentres(data.centres);
       if (data.uniformTypes && data.uniformTypes.length) DB.saveTypes(data.uniformTypes);
@@ -213,10 +219,10 @@ const CloudSync = {
         for (const t of data.transactions) await IDB.saveTransaction(t);
       }
       localStorage.setItem('ut_last_sync', new Date().toISOString());
-      showToast('✓ Data pulled from Google Sheets!', 'success');
+      if (!silent) showToast('✓ Data pulled from Google Sheets!', 'success');
       renderDashboard(); renderEmployeeList(); renderSettings();
     } catch (e) {
-      showToast('Pull error: ' + e.message, 'error');
+      if (!silent) showToast('Pull error: ' + e.message, 'error');
     } finally {
       if (btn) { btn.disabled = false; btn.textContent = 'Pull from Cloud'; }
       updateSyncStatus();
@@ -250,7 +256,12 @@ function updateSyncStatus() {
   const statusEl = document.getElementById('cloud-status-text');
   const dotEl    = document.getElementById('cloud-status-dot');
   const ts       = localStorage.getItem('ut_last_sync');
-  if (statusEl) statusEl.textContent = ts ? 'Last sync: ' + formatDateTime(ts) : 'Never synced';
+  const isAutoSync = autoSyncInterval && CloudSync.isReady();
+  
+  if (statusEl) {
+    const baseText = ts ? 'Last sync: ' + formatDateTime(ts) : 'Never synced';
+    statusEl.textContent = isAutoSync ? baseText + ' (Auto-sync active)' : baseText;
+  }
   if (dotEl)    dotEl.className = 'cloud-dot ' + (CloudSync.isReady() ? 'ready' : 'off');
 }
 
@@ -264,11 +275,50 @@ function saveCloudConfig() {
   CloudSync.configure(url, key);
   showToast('Cloud configuration saved! Click Test Connection to verify.', 'success');
   updateSyncStatus();
+  startAutoSync(); // Start automatic syncing if newly configured
 }
 window.saveCloudConfig = saveCloudConfig;
 window.cloudSyncAll    = () => CloudSync.syncAll();
-window.cloudPullAll    = () => CloudSync.pullAll();
+window.cloudPullAll    = () => CloudSync.pullAll(false); // Manual pull, show toasts
 window.cloudTestConn   = () => CloudSync.testConnection();
+
+// Automatic sync every 5 minutes
+let autoSyncInterval;
+function startAutoSync() {
+  // Clear any existing interval
+  if (autoSyncInterval) clearInterval(autoSyncInterval);
+  
+  // Only start if cloud sync is configured
+  if (!CloudSync.isReady()) return;
+  
+  // Sync every 5 minutes (300,000 ms)
+  autoSyncInterval = setInterval(async () => {
+    try {
+      // Only auto-sync if the app is visible (not in background tab)
+      if (document.hidden) return;
+      
+      console.log('Auto-syncing with Google Sheets...');
+      await CloudSync.pullAll(true); // Silent auto-sync
+      // Don't show toast for automatic syncs to avoid spam
+    } catch (e) {
+      console.warn('Auto-sync failed:', e.message);
+      // Don't show error toast for automatic syncs
+    }
+  }, 5 * 60 * 1000); // 5 minutes
+  
+  console.log('Automatic cloud sync started (every 5 minutes)');
+  updateSyncStatus(); // Update status to show auto-sync is active
+}
+
+// Stop auto sync when logging out
+function stopAutoSync() {
+  if (autoSyncInterval) {
+    clearInterval(autoSyncInterval);
+    autoSyncInterval = null;
+    console.log('Automatic cloud sync stopped');
+    updateSyncStatus(); // Update status to remove auto-sync indicator
+  }
+}
 
 // ============================================================
 // UTILITIES
@@ -426,6 +476,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const wrapper = document.querySelector('.emp-search-wrapper');
     if (dd && wrapper && !wrapper.contains(e.target)) dd.classList.add('hidden');
   });
+
+  // Start automatic cloud sync if configured
+  startAutoSync();
 });
 
 // ============================================================
@@ -454,6 +507,7 @@ window.handleLogin = handleLogin;
 
 function handleLogout() {
   console.log("handleLogout called!");
+  stopAutoSync(); // Stop automatic syncing
   currentUser = null;
   sessionStorage.removeItem('ut_active_user');
   document.body.removeAttribute('data-role');
