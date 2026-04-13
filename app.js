@@ -214,15 +214,27 @@ const CloudSync = {
         return; 
       }
       
-      // Track changes for notification
-      let hasChanges = false;
-      const oldEmployeeCount = DB.employees.length;
-      const oldTransactionCount = DB.transactions.length;
-      
-      // Update employees (simple replace)
+      // Normalize data types from Google Sheets (numbers to strings, etc.)
       if (data.employees) {
-        DB.saveEmployees(data.employees);
-        if (data.employees.length !== oldEmployeeCount) hasChanges = true;
+        data.employees = data.employees.map(e => ({
+          ...e,
+          firstName: String(e.firstName || ''),
+          lastName: String(e.lastName || ''),
+          employeeId: String(e.employeeId || ''),
+          productionCentre: String(e.productionCentre || ''),
+          department: String(e.department || ''),
+          phone: String(e.phone || ''),
+          notes: String(e.notes || '')
+        }));
+      }
+      if (data.transactions) {
+        data.transactions = data.transactions.map(t => ({
+          ...t,
+          barcode: String(t.barcode || ''),
+          employeeName: String(t.employeeName || ''),
+          uniformType: String(t.uniformType || ''),
+          notes: String(t.notes || '')
+        }));
       }
       
       // Update config data
@@ -370,7 +382,7 @@ function startAutoSync() {
   // Only start if cloud sync is configured
   if (!CloudSync.isReady()) return;
   
-  // Sync every 2 minutes (120,000 ms) - more frequent for better cross-device sync
+  // Sync every 30 seconds (30,000 ms) - more frequent for better cross-device sync
   autoSyncInterval = setInterval(async () => {
     try {
       // Always sync, even in background tabs (removed document.hidden check)
@@ -381,9 +393,9 @@ function startAutoSync() {
       console.warn('Auto-sync failed:', e.message);
       // Don't show error toast for automatic syncs to avoid spam
     }
-  }, 2 * 60 * 1000); // 2 minutes
+  }, 30 * 1000); // 30 seconds
   
-  console.log('Automatic cloud sync started (every 2 minutes)');
+  console.log('Automatic cloud sync started (every 30 seconds)');
   updateSyncStatus(); // Update status to show auto-sync is active
 }
 
@@ -411,7 +423,8 @@ function formatDateTime(iso) {
 }
 function avatarColor(name) {
   const colors = ['#2563eb','#7c3aed','#db2777','#d97706','#059669','#0891b2','#dc2626','#65a30d'];
-  let h = 0; for (let c of (name||'A')) h = (h*31 + c.charCodeAt(0)) & 0xffffffff;
+  const text = String(name || 'A');
+  let h = 0; for (let c of text) h = (h*31 + c.charCodeAt(0)) & 0xffffffff;
   return colors[Math.abs(h) % colors.length];
 }
 function initials(first, last) { return ((first||'')[0]||'') + ((last||'')[0]||''); }
@@ -667,24 +680,28 @@ const ROLE_PERMISSIONS = {
   admin: {
     actions: ['received_from_cintas', 'distributed', 'reported_issue', 'returned', 'sent_to_cintas'],
     canManageUsers: true,
+    canManageEmployees: true,
     canDeleteTransactions: true,
     canExportData: true
   },
   operator: {
     actions: ['received_from_cintas', 'distributed', 'reported_issue', 'returned', 'sent_to_cintas'],
     canManageUsers: false,
+    canManageEmployees: false,
     canDeleteTransactions: true,
     canExportData: false
   },
   warehouse: {
     actions: ['received_from_cintas', 'returned', 'sent_to_cintas'],
     canManageUsers: false,
+    canManageEmployees: false,
     canDeleteTransactions: false,
     canExportData: true
   },
   manager: {
     actions: [],
     canManageUsers: false,
+    canManageEmployees: false,
     canDeleteTransactions: false,
     canExportData: false
   }
@@ -700,6 +717,12 @@ function canManageUsers() {
   if (!currentUser) return false;
   const permissions = ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator;
   return permissions.canManageUsers;
+}
+
+function canManageEmployees() {
+  if (!currentUser) return false;
+  const permissions = ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator;
+  return permissions.canManageEmployees;
 }
 
 function canDeleteTransactions() {
@@ -767,7 +790,7 @@ function showPage(page) {
   if (pageEl) pageEl.classList.add('active');
   const navEl = document.querySelector(`.nav-item[data-page="${page}"]`);
   if (navEl) navEl.classList.add('active');
-  const titles = {dashboard:'Dashboard',employees:'Employees',scan:'Scan Entry',reports:'Reports',settings:'Settings'};
+  const titles = {dashboard:'Dashboard',employees:'Employees',scan:'Scan Entry',reports:'Reports',settings:'Settings',users:'User Management'};
   document.getElementById('pageTitle').textContent = titles[page] || page;
   // Start/stop scanner focus lock
   if (page === 'scan') {
@@ -781,6 +804,7 @@ function showPage(page) {
   if (page === 'scan')      setTimeout(() => { document.getElementById('barcodeInput').focus(); }, 150);
   if (page === 'reports')   renderReport();
   if (page === 'settings')  renderSettings();
+  if (page === 'users')     renderUsers();
 }
 
 // ============================================================
@@ -843,6 +867,11 @@ function renderEmployeeList() {
     e.productionCentre?.toLowerCase().includes(query)
   );
   const container = document.getElementById('employee-list');
+  const canEdit = canManageEmployees();
+  const addButton = document.querySelector('#page-employees .btn-primary');
+  if (addButton) {
+    addButton.style.display = canEdit ? 'inline-flex' : 'none';
+  }
   if (!list.length) {
     container.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/></svg><p>${query ? 'No employees match.' : 'No employees yet. Click "Add Employee" to start.'}</p></div>`;
     return;
@@ -865,12 +894,12 @@ function renderEmployeeList() {
       <div class="emp-card-footer">
         <div class="emp-uniform-count">Holding: <strong>${held}</strong> uniform${held!==1?'s':''}</div>
         <div class="emp-card-actions" onclick="event.stopPropagation()">
-          <button class="emp-action-btn" title="Edit" onclick="openEmployeeModal('${e.id}')">
+          ${canEdit ? `<button class="emp-action-btn" title="Edit" onclick="openEmployeeModal('${e.id}')">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
           </button>
           <button class="emp-action-btn del" title="Delete" onclick="deleteEmployee('${e.id}')">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
-          </button>
+          </button>` : ''}
         </div>
       </div>
     </div>`;
@@ -878,6 +907,10 @@ function renderEmployeeList() {
 }
 
 function openEmployeeModal(id) {
+  if (!canManageEmployees()) {
+    showToast('Access denied. Only Admin can manage employees.', 'error');
+    return;
+  }
   document.getElementById('emp-modal-title').textContent = id ? 'Edit Employee' : 'Add Employee';
   document.getElementById('emp-id').value = id || '';
   const sel = document.getElementById('emp-centre');
@@ -901,6 +934,10 @@ function openEmployeeModal(id) {
 }
 
 function saveEmployee() {
+  if (!canManageEmployees()) {
+    showToast('Access denied. Only Admin can manage employees.', 'error');
+    return;
+  }
   const first = document.getElementById('emp-first').value.trim();
   const last  = document.getElementById('emp-last').value.trim();
   if (!first || !last) { showToast('First and last name are required.', 'error'); return; }
@@ -926,6 +963,10 @@ function saveEmployee() {
 }
 
 function deleteEmployee(id) {
+  if (!canManageEmployees()) {
+    showToast('Access denied. Only Admin can delete employees.', 'error');
+    return;
+  }
   const e = DB.employees.find(emp => emp.id === id);
   if (!e) return;
   confirm_dialog(`Delete ${e.firstName} ${e.lastName}?`, 'This employee will be removed. Their transaction history will be kept.', () => {
@@ -1660,12 +1701,14 @@ function renderSettings() {
   if (canManageUsers()) {
     const uBody = document.getElementById('users-tbody');
     if (uBody) {
-      if (!DB.users.length) { uBody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--text3)">No users found.</td></tr>'; }
+      if (!DB.users.length) { uBody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text3)">No users found.</td></tr>'; }
       else {
         uBody.innerHTML = DB.users.map(u => `<tr>
           <td><strong>${escHtml(u.username)}</strong></td>
           <td>${u.role==='admin'?'<span style="color:var(--red);font-weight:600">Admin</span>':u.role==='manager'?'<span style="color:var(--purple);font-weight:600">Manager</span>':u.role==='warehouse'?'<span style="color:var(--green);font-weight:600">Warehouse</span>':'Operator'}</td>
+          <td>${u.password ? '<span style="color:var(--text2);font-size:0.9rem">••••••••</span>' : '<span style="color:var(--text3);font-size:0.9rem">No password</span>'}</td>
           <td style="text-align:right">
+            <button class="btn-text" onclick="openUserModal('${u.username}')">Edit</button>
             <button class="btn-text" style="color:var(--red)" onclick="removeUser('${u.username}')">Remove</button>
           </td>
         </tr>`).join('');
@@ -1673,6 +1716,59 @@ function renderSettings() {
     }
   }
 }
+
+function renderUsers() {
+  if (!canManageUsers()) return;
+  renderSettings(); // Keep settings consistent
+  const userPageBody = document.getElementById('user-page-body');
+  if (!userPageBody) return;
+  const uBody = document.getElementById('users-tbody');
+  if (!uBody) return;
+  if (!DB.users.length) {
+    uBody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text3)">No users found.</td></tr>';
+  } else {
+    uBody.innerHTML = DB.users.map(u => `<tr>
+      <td><strong>${escHtml(u.username)}</strong></td>
+      <td>${u.role==='admin'?'<span style="color:var(--red);font-weight:600">Admin</span>':u.role==='manager'?'<span style="color:var(--purple);font-weight:600">Manager</span>':u.role==='warehouse'?'<span style="color:var(--green);font-weight:600">Warehouse</span>':'Operator'}</td>
+      <td>${u.password ? '<span style="color:var(--text2);font-size:0.9rem">••••••••</span>' : '<span style="color:var(--text3);font-size:0.9rem">No password</span>'}</td>
+      <td style="text-align:right">
+        <button class="btn-text" onclick="openUserModal('${u.username}')">Edit</button>
+        <button class="btn-text" style="color:var(--red)" onclick="removeUser('${u.username}')">Remove</button>
+      </td>
+    </tr>`).join('');
+  }
+}
+
+function openUserModal(username) {
+  if (!canManageUsers()) return;
+  const user = DB.users.find(u => u.username === username);
+  if (!user) return;
+  document.getElementById('user-modal-title').textContent = `Edit user: ${escHtml(user.username)}`;
+  document.getElementById('user-username').value = user.username;
+  document.getElementById('user-password').value = '';
+  document.getElementById('user-role').value = user.role;
+  openModal('user-modal');
+}
+
+function saveUser() {
+  if (!canManageUsers()) return;
+  const username = document.getElementById('user-username').value.trim();
+  const password = document.getElementById('user-password').value;
+  const role     = document.getElementById('user-role').value;
+  if (!username || !role) return showToast('Username and role are required.', 'error');
+
+  const user = DB.users.find(u => u.username === username);
+  if (!user) return showToast('User not found.', 'error');
+  user.role = role;
+  if (password) user.password = password;
+  DB.saveUsers(DB.users);
+  closeModal('user-modal');
+  showToast(`User ${username} updated.`, 'success');
+  renderUsers();
+}
+
+window.openUserModal = openUserModal;
+window.saveUser = saveUser;
 
 function addUser() {
   console.log("addUser called with currentUser:", currentUser);
