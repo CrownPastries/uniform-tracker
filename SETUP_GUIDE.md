@@ -1,6 +1,7 @@
 # UniTrack — Setup Guide
 
 ## Overview
+
 UniTrack stores data locally in **IndexedDB** (in-browser) and can optionally sync to
 **Google Sheets** for cloud backup and cross-device access.  
 The app is deployed as a static site on **GitHub Pages** — no server or monthly fees needed.
@@ -25,8 +26,8 @@ The app is deployed as a static site on **GitHub Pages** — no server or monthl
 3. Open the file `Code.gs` from this project and **paste the entire contents** into the editor.
 4. Replace the two constants at the top:
    ```js
-   const SHEET_ID = 'paste-your-sheet-id-here';
-   const API_KEY  = 'choose-any-secret-string';   // e.g. "MyFactory2024!"
+   const SHEET_ID = "paste-your-sheet-id-here";
+   const API_KEY = "choose-any-secret-string"; // e.g. "MyFactory2024!"
    ```
 5. Click **Save** (floppy disk icon).
 6. Click **Deploy → New Deployment**.
@@ -52,11 +53,11 @@ The app is deployed as a static site on **GitHub Pages** — no server or monthl
 
 ### How sync works
 
-| Button | What it does |
-|---|---|
-| **Test Connection** | Verifies the URL and key are correct |
+| Button                | What it does                                               |
+| --------------------- | ---------------------------------------------------------- |
+| **Test Connection**   | Verifies the URL and key are correct                       |
 | **Push All to Cloud** | Overwrites Google Sheets with everything in your local app |
-| **Pull from Cloud** | Overwrites your local app with what's in Google Sheets |
+| **Pull from Cloud**   | Overwrites your local app with what's in Google Sheets     |
 
 New scans and employee saves are **automatically pushed** to Google Sheets in the background.  
 Use **Pull from Cloud** on a second device to load the latest data.
@@ -66,6 +67,7 @@ Use **Pull from Cloud** on a second device to load the latest data.
 ## Part 2 — GitHub Pages Deployment
 
 ### Prerequisites
+
 - A free [GitHub account](https://github.com)
 - Git installed on your machine (`git --version` to check)
 
@@ -117,6 +119,7 @@ git add .
 git commit -m "Describe your change"
 git push
 ```
+
 GitHub Pages auto-deploys within ~1 minute.
 
 ---
@@ -132,9 +135,9 @@ GitHub Pages auto-deploys within ~1 minute.
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---|---|
-| "Unauthorized" error | API Key in the app doesn't match `Code.gs` |
-| CORS error | Make sure you deployed as **Anyone** not "Anyone with a Google Account" |
-| Changes to Code.gs not working | You must create a **New Deployment** — editing and saving is not enough |
-| App data gone after clearing browser | Use **Pull from Cloud** to restore from Google Sheets |
+| Problem                              | Solution                                                                |
+| ------------------------------------ | ----------------------------------------------------------------------- |
+| "Unauthorized" error                 | API Key in the app doesn't match `Code.gs`                              |
+| CORS error                           | Make sure you deployed as **Anyone** not "Anyone with a Google Account" |
+| Changes to Code.gs not working       | You must create a **New Deployment** — editing and saving is not enough |
+| App data gone after clearing browser | Use **Pull from Cloud** to restore from Google Sheets                   |
