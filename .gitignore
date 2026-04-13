@@ -1,0 +1,9 @@
+# Keep Code.gs out of the public repo — it contains your API key and Sheet ID
+Code.gs
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
