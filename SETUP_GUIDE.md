@@ -140,12 +140,12 @@ GitHub Pages auto-deploys within ~1 minute.
 
 UniTrack includes role-based access control. The app starts with four default users:
 
-| Username  | Password    | Role      | Permissions |
-|-----------|-------------|-----------|-------------|
-| Admin     | Admin1980   | Admin     | All access: manage users, transactions, settings, export data |
-| Operator  | Oper1234    | Operator  | All transactions: add, edit, delete uniforms |
-| Warehouse | Wh1234      | Warehouse | Receive from Cintas, return to Cintas |
-| Manager   | Manager123  | Manager   | View only: see reports and data, no modifications |
+| Username  | Password   | Role      | Permissions                                                   |
+| --------- | ---------- | --------- | ------------------------------------------------------------- |
+| Admin     | Admin1980  | Admin     | All access: manage users, transactions, settings, export data |
+| Operator  | Oper1234   | Operator  | All transactions: add, edit, delete uniforms                  |
+| Warehouse | Wh1234     | Warehouse | Receive from Cintas, return to Cintas                         |
+| Manager   | Manager123 | Manager   | View only: see reports and data, no modifications             |
 
 ### Adding/Removing Users
 
