@@ -136,6 +136,32 @@ GitHub Pages auto-deploys within ~1 minute.
 
 ---
 
+## User Roles and Permissions
+
+UniTrack includes role-based access control. The app starts with four default users:
+
+| Username  | Password    | Role      | Permissions |
+|-----------|-------------|-----------|-------------|
+| Admin     | Admin1980   | Admin     | All access: manage users, transactions, settings, export data |
+| Operator  | Oper1234    | Operator  | All transactions: add, edit, delete uniforms |
+| Warehouse | Wh1234      | Warehouse | Receive from Cintas, return to Cintas |
+| Manager   | Manager123  | Manager   | View only: see reports and data, no modifications |
+
+### Adding/Removing Users
+
+- Only **Admin** users can manage other users via **Settings → User Management**.
+- Use the form to add new users with custom usernames/passwords and assign roles.
+- Default users cannot be removed — only custom users can be deleted.
+
+### Role Permissions Details
+
+- **Admin**: Full access to all features including user management and data export.
+- **Operator**: Can perform all transaction types (receive, distribute, report issues, return, send to Cintas).
+- **Warehouse**: Limited to Cintas interactions (receive new uniforms, send back to Cintas).
+- **Manager**: Read-only access to view reports and current data, cannot modify anything.
+
+---
+
 ## Security Notes
 
 - Your API Key is stored in the browser's `localStorage` on each device — it is **not** in the source code that goes to GitHub.

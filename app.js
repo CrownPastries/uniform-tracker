@@ -510,7 +510,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Users
     let userData = await IDB.get('ut_users');
     if (!userData || userData.length === 0) {
-      userData = [{ username: 'admin', password: 'admin', role: 'admin' }];
+      userData = [
+        { username: 'Admin', password: 'Admin1980', role: 'admin' },
+        { username: 'Operator', password: 'Oper1234', role: 'operator' },
+        { username: 'Warehouse', password: 'Wh1234', role: 'warehouse' },
+        { username: 'Manager', password: 'Manager123', role: 'manager' }
+      ];
       hasMigratedAny = true;
     }
     DB_MEMORY.users = userData;
@@ -637,20 +642,20 @@ const ROLE_PERMISSIONS = {
     canDeleteTransactions: true,
     canExportData: true
   },
+  operator: {
+    actions: ['received_from_cintas', 'distributed', 'reported_issue', 'returned', 'sent_to_cintas'],
+    canManageUsers: false,
+    canDeleteTransactions: true,
+    canExportData: false
+  },
   warehouse: {
     actions: ['received_from_cintas', 'returned', 'sent_to_cintas'],
     canManageUsers: false,
     canDeleteTransactions: false,
     canExportData: true
   },
-  sasoon: {
-    actions: ['received_from_cintas', 'sent_to_cintas'],
-    canManageUsers: false,
-    canDeleteTransactions: false,
-    canExportData: false
-  },
-  operator: {
-    actions: ['distributed', 'reported_issue', 'returned'],
+  manager: {
+    actions: [],
     canManageUsers: false,
     canDeleteTransactions: false,
     canExportData: false
@@ -1631,7 +1636,7 @@ function renderSettings() {
       else {
         uBody.innerHTML = DB.users.map(u => `<tr>
           <td><strong>${escHtml(u.username)}</strong></td>
-          <td>${u.role==='admin'?'<span style="color:var(--red);font-weight:600">Admin</span>':u.role==='sasoon'?'<span style="color:var(--blue);font-weight:600">Sasoon</span>':u.role==='warehouse'?'<span style="color:var(--green);font-weight:600">Warehouse</span>':'Operator'}</td>
+          <td>${u.role==='admin'?'<span style="color:var(--red);font-weight:600">Admin</span>':u.role==='manager'?'<span style="color:var(--purple);font-weight:600">Manager</span>':u.role==='warehouse'?'<span style="color:var(--green);font-weight:600">Warehouse</span>':'Operator'}</td>
           <td style="text-align:right">
             <button class="btn-text" style="color:var(--red)" onclick="removeUser('${u.username}')">Remove</button>
           </td>
