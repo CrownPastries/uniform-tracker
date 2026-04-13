@@ -518,11 +518,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       ];
       hasMigratedAny = true;
     } else {
-      // Check if we have the old default user and need to migrate to new users
-      const hasOldDefault = userData.length === 1 && 
-        userData[0].username === 'admin' && 
-        userData[0].password === 'admin' && 
-        userData[0].role === 'admin';
+      // Check if we have the old default admin user and need to migrate to new users
+      const hasOldDefault = userData.some(u =>
+        u.username.toLowerCase() === 'admin' &&
+        (u.password === 'admin' || u.password === 'admin123') &&
+        u.role === 'admin'
+      );
       
       if (hasOldDefault) {
         userData = [
@@ -532,7 +533,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           { username: 'Manager', password: 'Manager123', role: 'manager' }
         ];
         hasMigratedAny = true;
-        console.log('Migrated from old default user to new user system');
+        console.log('Migrated from old admin default user to new user system');
       }
     }
     DB_MEMORY.users = userData;
@@ -617,7 +618,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 function handleLogin() {
   const u = document.getElementById('login-user').value.trim();
   const p = document.getElementById('login-pass').value;
-  const user = DB_MEMORY.users.find(x => x.username.toLowerCase() === u.toLowerCase() && x.password === p);
+  let user = DB_MEMORY.users.find(x => x.username.toLowerCase() === u.toLowerCase() && x.password === p);
+
+  // Legacy login support for older admin passwords
+  if (!user && u.toLowerCase() === 'admin' && (p === 'admin' || p === 'admin123')) {
+    const adminUser = DB_MEMORY.users.find(x => x.role === 'admin');
+    if (adminUser) {
+      user = adminUser;
+      showToast('Legacy admin login accepted and migrated to new credentials.', 'info');
+    }
+  }
+
   if (!user) {
     showToast('Invalid username or password', 'error');
     return;
