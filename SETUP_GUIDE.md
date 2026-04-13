@@ -56,20 +56,22 @@ The app is deployed as a static site on **GitHub Pages** — no server or monthl
 | Button                | What it does                                               |
 | --------------------- | ---------------------------------------------------------- |
 | **Test Connection**   | Verifies the URL and key are correct                       |
+| **Sync Now**          | Immediately pulls latest data from Google Sheets           |
 | **Push All to Cloud** | Overwrites Google Sheets with everything in your local app |
 | **Pull from Cloud**   | Overwrites your local app with what's in Google Sheets     |
 
 **Automatic Syncing**:
 
 - New scans and employee saves are **automatically pushed** to Google Sheets in the background
-- The app **automatically pulls** updates from Google Sheets every 5 minutes when cloud sync is configured
+- The app **automatically pulls** updates from Google Sheets every 2 minutes when cloud sync is configured
+- Use **Sync Now** for immediate updates from other devices
 - Use **Pull from Cloud** manually if you need immediate updates from other devices
-- The status shows "Auto-sync active" when automatic syncing is running
+- The status shows when the last sync happened and if auto-sync is active
 
 **Cross-Device Usage**:
 
 - Device A scans a barcode → automatically pushes to Google Sheets
-- Device B automatically pulls the update within 5 minutes (or manually via "Pull from Cloud")
+- Device B automatically pulls the update within 2 minutes (or instantly via "Sync Now")
 - All devices stay synchronized without manual intervention
 
 ---
