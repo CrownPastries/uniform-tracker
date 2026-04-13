@@ -517,6 +517,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         { username: 'Manager', password: 'Manager123', role: 'manager' }
       ];
       hasMigratedAny = true;
+    } else {
+      // Check if we have the old default user and need to migrate to new users
+      const hasOldDefault = userData.length === 1 && 
+        userData[0].username === 'admin' && 
+        userData[0].password === 'admin' && 
+        userData[0].role === 'admin';
+      
+      if (hasOldDefault) {
+        userData = [
+          { username: 'Admin', password: 'Admin1980', role: 'admin' },
+          { username: 'Operator', password: 'Oper1234', role: 'operator' },
+          { username: 'Warehouse', password: 'Wh1234', role: 'warehouse' },
+          { username: 'Manager', password: 'Manager123', role: 'manager' }
+        ];
+        hasMigratedAny = true;
+        console.log('Migrated from old default user to new user system');
+      }
     }
     DB_MEMORY.users = userData;
 
@@ -600,7 +617,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 function handleLogin() {
   const u = document.getElementById('login-user').value.trim();
   const p = document.getElementById('login-pass').value;
-  const user = DB_MEMORY.users.find(x => x.username === u && x.password === p);
+  const user = DB_MEMORY.users.find(x => x.username.toLowerCase() === u.toLowerCase() && x.password === p);
   if (!user) {
     showToast('Invalid username or password', 'error');
     return;
