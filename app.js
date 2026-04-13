@@ -127,16 +127,34 @@ const CloudSync = {
   async post(action, payload) {
     const resp = await fetch(this.apiUrl, {
       method: 'POST',
+      redirect: 'follow',
       body: JSON.stringify({ key: this.apiKey, action, payload }),
       headers: { 'Content-Type': 'text/plain' }
     });
-    return resp.json();
+    return this._parseResp(resp);
   },
 
   async get(action) {
     const url = `${this.apiUrl}?key=${encodeURIComponent(this.apiKey)}&action=${encodeURIComponent(action)}`;
-    const resp = await fetch(url);
-    return resp.json();
+    const resp = await fetch(url, { redirect: 'follow' });
+    return this._parseResp(resp);
+  },
+
+  // Parse Apps Script response safely — HTML (login redirects, errors) returns a useful message
+  async _parseResp(resp) {
+    const text = await resp.text();
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      // HTML means Apps Script redirected to login or the script threw an unhandled error
+      if (text.includes('<!DOCTYPE') || text.includes('<html')) {
+        if (text.includes('signin') || text.includes('accounts.google')) {
+          throw new Error('Apps Script requires authorization. Open the Web App URL directly in your browser and sign in, then retry.');
+        }
+        throw new Error('Apps Script returned an HTML page instead of JSON. Make sure you deployed as "Anyone" (not "Anyone with Google Account") and created a New Version deployment.');
+      }
+      throw new Error('Invalid response from Apps Script: ' + text.slice(0, 120));
+    }
   },
 
   async pushTransaction(txn) {
@@ -240,8 +258,11 @@ function saveCloudConfig() {
   const url = (document.getElementById('cloud-url')?.value || '').trim();
   const key = (document.getElementById('cloud-key')?.value || '').trim();
   if (!url || !key) { showToast('Please enter both the Web App URL and API Key.', 'error'); return; }
+  if (!url.includes('script.google.com/macros/s/')) {
+    showToast('URL looks wrong — it should contain script.google.com/macros/s/', 'error'); return;
+  }
   CloudSync.configure(url, key);
-  showToast('Cloud configuration saved!', 'success');
+  showToast('Cloud configuration saved! Click Test Connection to verify.', 'success');
   updateSyncStatus();
 }
 window.saveCloudConfig = saveCloudConfig;
