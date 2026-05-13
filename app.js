@@ -440,6 +440,7 @@ function actionLabel(a) {
   return {
     distributed:          'Distributed',
     returned:             'Returned',
+    collected_from_soil_bin: 'Soil Bin Collection',
     sent_to_cintas:       '→ Cintas',
     received_from_cintas: '← Cintas',
     reported_issue:       'Issue/Damaged'
@@ -686,21 +687,21 @@ window.handleLogout = handleLogout;
 // ============================================================
 const ROLE_PERMISSIONS = {
   admin: {
-    actions: ['received_from_cintas', 'distributed', 'reported_issue', 'returned', 'sent_to_cintas'],
+    actions: ['received_from_cintas', 'distributed', 'reported_issue', 'returned', 'collected_from_soil_bin', 'sent_to_cintas'],
     canManageUsers: true,
     canManageEmployees: true,
     canDeleteTransactions: true,
     canExportData: true
   },
   operator: {
-    actions: ['received_from_cintas', 'distributed', 'reported_issue', 'returned', 'sent_to_cintas'],
+    actions: ['received_from_cintas', 'distributed', 'reported_issue', 'returned', 'collected_from_soil_bin', 'sent_to_cintas'],
     canManageUsers: false,
     canManageEmployees: false,
     canDeleteTransactions: true,
     canExportData: false
   },
   warehouse: {
-    actions: ['received_from_cintas', 'returned', 'sent_to_cintas'],
+    actions: ['received_from_cintas', 'returned', 'collected_from_soil_bin', 'sent_to_cintas'],
     canManageUsers: false,
     canManageEmployees: false,
     canDeleteTransactions: false,
@@ -828,7 +829,7 @@ function computeStats() {
     if      (last.action === 'distributed')                                        out++;
     else if (last.action === 'sent_to_cintas')                                     cintas++;
     else if (last.action === 'reported_issue')                                     issues++;
-    else if (last.action === 'returned' || last.action === 'received_from_cintas') warehouse++;
+    else if (last.action === 'returned' || last.action === 'received_from_cintas' || last.action === 'collected_from_soil_bin') warehouse++
   });
   return { total: barcodes.length, out, cintas, warehouse, issues };
 }
@@ -1028,7 +1029,7 @@ function setAction(action) {
   if (tab) tab.classList.add('active');
 
   const selector      = document.getElementById('employee-selector');
-  const needsEmployee = action === 'distributed' || action === 'returned';
+  const needsEmployee = action === 'distributed' || action === 'returned' || action === 'collected_from_soil_bin';
   selector.style.display = needsEmployee ? 'block' : 'none';
 
   // Update scanner hint text
@@ -1037,6 +1038,7 @@ function setAction(action) {
     distributed:          'Select employee above — then scan each item',
     reported_issue:       'Scan damaged / dirty items to flag them',
     returned:             'Scan each item being returned to warehouse',
+    collected_from_soil_bin: 'Select employee — then scan items collected from their soil bin',
     sent_to_cintas:       'Scan each item going back to Cintas'
   };
   const hintEl = document.getElementById('scannerHintText');
@@ -1096,7 +1098,14 @@ function onBarcodeInput() {
   // Show typing feedback while barcode chars are coming in
   const val    = document.getElementById('barcodeInput').value;
   const status = document.getElementById('scannerStatusText');
-  if (status && val) status.textContent = `READING… ${val}`;
+  if (status && val) {
+    const validation = validateBarcode(val);
+    if (validation.valid) {
+      status.textContent = `✓ READY (${val.length} chars)`;
+    } else {
+      status.textContent = `⚠ INCOMPLETE (${val.length}/${BARCODE_CONFIG.minLength} chars)`;
+    }
+  }
 }
 
 function filterScanEmployees() { showEmpDropdown(); }
@@ -1149,7 +1158,85 @@ function clearEmployee() {
   document.getElementById('scan-emp-dropdown').classList.add('hidden');
 }
 
-function handleBarcodeKey(e) { if (e.key === 'Enter') { e.preventDefault(); submitScan(); } }
+// ============================================================
+//  BARCODE VALIDATION
+// ============================================================
+const BARCODE_CONFIG = {
+  minLength: 13,          // Reject barcodes shorter than this
+  maxLength: 15,          // Reject barcodes longer than this
+  allowPartialSubmit: false // If false, sound error for incomplete barcodes
+};
+
+// Play error sound
+function playErrorSound() {
+  try {
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+    
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    
+    // Error beep: low frequency, short duration
+    oscillator.frequency.setValueAtTime(200, audioContext.currentTime);
+    oscillator.frequency.setValueAtTime(150, audioContext.currentTime + 0.1);
+    
+    gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+    gainNode.gain.setValueAtTime(0, audioContext.currentTime + 0.15);
+    
+    oscillator.start(audioContext.currentTime);
+    oscillator.stop(audioContext.currentTime + 0.15);
+  } catch (e) {
+    console.warn('Could not play error sound:', e.message);
+  }
+}
+
+// Validate barcode format and length
+function validateBarcode(barcode) {
+  barcode = (barcode || '').trim();
+  
+  // Check if empty
+  if (!barcode) {
+    return { valid: false, reason: 'Barcode is empty' };
+  }
+  
+  // Check if only digits
+  if (!/^\d+$/.test(barcode)) {
+    return { valid: false, reason: 'Barcode must contain only digits (0-9)' };
+  }
+  
+  // Check minimum length
+  if (barcode.length < BARCODE_CONFIG.minLength) {
+    return { valid: false, reason: `Barcode too short (${barcode.length} digits). Must be 13-15 digits.` };
+  }
+  
+  // Check maximum length
+  if (barcode.length > BARCODE_CONFIG.maxLength) {
+    return { valid: false, reason: `Barcode too long (${barcode.length} digits). Must be 13-15 digits.` };
+  }
+  
+  // Check for common scanner issues (e.g., multiple line breaks, null chars)
+  if (/[\x00\n\r]/g.test(barcode)) {
+    return { valid: false, reason: 'Barcode contains invalid characters. Scan may be corrupted.' };
+  }
+  
+  return { valid: true, reason: '' };
+}
+
+function handleBarcodeKey(e) { 
+  if (e.key === 'Enter') { 
+    e.preventDefault();
+    // Validate before submitting
+    const barcode = document.getElementById('barcodeInput').value.trim();
+    const validation = validateBarcode(barcode);
+    if (!validation.valid) {
+      playErrorSound();
+      showToast(`⚠ Invalid Barcode: ${validation.reason}`, 'error');
+      return;
+    }
+    submitScan();
+  }
+}
 
 // Check if barcode was already logged with the same action on the same date
 function checkDuplicate(barcode, action, date) {
@@ -1176,10 +1263,18 @@ function flashDuplicateWarning(barcode) {
 
 function submitScan() {
   const barcode = document.getElementById('barcodeInput').value.trim();
-  if (!barcode) { showToast('Please scan or enter a barcode.', 'error'); return; }
+  
+  // ---- BARCODE VALIDATION ----
+  const validation = validateBarcode(barcode);
+  if (!validation.valid) {
+    playErrorSound();
+    showToast(`⚠ Invalid Barcode: ${validation.reason}`, 'error');
+    // Don't clear input; let user try again or edit
+    return;
+  }
 
-  const needsEmployee = currentAction === 'distributed' || currentAction === 'returned';
-  if (currentAction === 'distributed' && !selectedEmployee) {
+  const needsEmployee = currentAction === 'distributed' || currentAction === 'returned' || currentAction === 'collected_from_soil_bin';
+  if ((currentAction === 'distributed' || currentAction === 'collected_from_soil_bin') && !selectedEmployee) {
     showToast('Please select an employee first.', 'error');
     document.getElementById('scan-emp-search').focus();
     return;
@@ -1207,12 +1302,19 @@ function submitScan() {
 }
 
 function doSaveScan(barcode, action, date, notes) {
-  const needsEmployee = action === 'distributed' || action === 'returned';
+  const needsEmployee = action === 'distributed' || action === 'returned' || action === 'collected_from_soil_bin';
+  
+  // For soil bin collections, automatically add a note
+  let finalNotes = notes;
+  if (action === 'collected_from_soil_bin') {
+    finalNotes = (notes ? notes + ' • ' : '') + 'Collected from soil bin';
+  }
+  
   const txn = {
     id: uid(), barcode, action,
     employeeId:   (needsEmployee && selectedEmployee) ? selectedEmployee.id   : null,
     employeeName: (needsEmployee && selectedEmployee) ? `${selectedEmployee.firstName} ${selectedEmployee.lastName}` : null,
-    date, notes,
+    date, notes: finalNotes,
     createdAt: new Date().toISOString()
   };
 
@@ -1253,7 +1355,7 @@ function manualSubmit() {
   const barcode = document.getElementById('manual-barcode').value.trim();
   if (!barcode) { showToast('Please enter a barcode.', 'error'); return; }
 
-  if (currentAction === 'distributed' && !selectedEmployee) {
+  if ((currentAction === 'distributed' || currentAction === 'collected_from_soil_bin') && !selectedEmployee) {
     showToast('Please select an employee first.', 'error');
     closeModal('manual-entry-modal');
     document.getElementById('scan-emp-search').focus();
@@ -1490,10 +1592,13 @@ function renderReport() {
     const rows = [];
     barcodes.forEach(bc => {
       const last = latestTxn(bc);
-      if (!last || (last.action !== 'returned' && last.action !== 'received_from_cintas')) return;
+      if (!last || (last.action !== 'returned' && last.action !== 'received_from_cintas' && last.action !== 'collected_from_soil_bin' && last.action !== 'collected_from_soil_bin')) return;
       if (!inRange(last.date)) return;
       if (q && !bc.toLowerCase().includes(q)) return;
-      rows.push({ barcode: bc, date: last.date, how: last.action, notes: last.notes||'' });
+      const howDisplay = last.action === 'collected_from_soil_bin' ? 'Collected from Soil Bin' : 
+                         last.action === 'returned' ? 'Returned' : 
+                         'Received from Cintas';
+      rows.push({ barcode: bc, date: last.date, how: last.action, howDisplay, notes: last.notes||'' });
     });
     container.innerHTML = `
       <div class="report-summary">
@@ -1502,11 +1607,11 @@ function renderReport() {
         <div class="rs-card"><div class="rs-num">${rows.filter(r=>r.how==='received_from_cintas').length}</div><div class="rs-label">Received from Cintas</div></div>
       </div>
       <div class="report-table-wrap"><table class="report-table">
-        <thead><tr><th>Barcode</th><th>Arrived</th><th>How</th><th>Notes</th></tr></thead>
+        <thead><tr><th>Barcode</th><th>Date Received</th><th>Source</th><th>Notes</th></tr></thead>
         <tbody>${rows.length ? rows.map(r => `<tr>
           <td class="bc-mono">${escHtml(r.barcode)}</td>
           <td>${formatDate(r.date)}</td>
-          <td><span class="report-badge ${r.how==='returned'?'returned':'warehouse'}">${r.how==='returned'?'Employee Return':'From Cintas'}</span></td>
+          <td><span class="report-badge ${r.how==='collected_from_soil_bin'?'issue':r.how==='returned'?'returned':'warehouse'}">${r.howDisplay}</span></td>
           <td>${escHtml(r.notes)}</td>
         </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:30px">No uniforms currently in warehouse.</td></tr>'}</tbody>
       </table></div>`;
