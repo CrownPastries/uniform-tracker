@@ -241,7 +241,8 @@ const CloudSync = {
           barcode: String(t.barcode || ''),
           employeeName: String(t.employeeName || ''),
           uniformType: String(t.uniformType || ''),
-          notes: String(t.notes || '')
+          notes: String(t.notes || ''),
+          date: normalizeDate(t.date)
         }));
       }
       
@@ -422,7 +423,19 @@ function stopAutoSync() {
 // ============================================================
 function uid()  { return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
 function today(){ return new Date().toISOString().slice(0,10); }
-function formatDate(d) { if (!d) return ''; const [y,m,day] = d.split('-'); return `${m}/${day}/${y}`; }
+function normalizeDate(d) {
+  if (!d) return today();
+  // If already in YYYY-MM-DD format, return as-is
+  if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
+  // If in MM/DD/YYYY format, convert to YYYY-MM-DD
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(d)) {
+    const [m, day, y] = d.split('/');
+    return `${y}-${String(m).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  }
+  // Otherwise assume ISO and extract the date portion
+  return d.split('T')[0] || today();
+}
+function formatDate(d) { if (!d) return ''; const date = normalizeDate(d); const [y,m,day] = date.split('-'); return `${m}/${day}/${y}`; }
 function formatDateTime(iso) {
   if (!iso) return '';
   const d = new Date(iso);
@@ -1280,7 +1293,7 @@ function submitScan() {
     return;
   }
 
-  const date = document.getElementById('scan-date').value || today();
+  const date = normalizeDate(document.getElementById('scan-date').value || today());
 
   // ---- Duplicate check ----
   const dup = checkDuplicate(barcode, currentAction, date);
@@ -1353,7 +1366,8 @@ function openManualEntry() {
 
 function manualSubmit() {
   const barcode = document.getElementById('manual-barcode').value.trim();
-  if (!barcode) { showToast('Please enter a barcode.', 'error'); return; }
+  const validation = validateBarcode(barcode);
+  if (!validation.valid) { playErrorSound(); showToast(validation.reason, 'error'); return; }
 
   if ((currentAction === 'distributed' || currentAction === 'collected_from_soil_bin') && !selectedEmployee) {
     showToast('Please select an employee first.', 'error');
@@ -1362,7 +1376,7 @@ function manualSubmit() {
     return;
   }
 
-  const date  = document.getElementById('scan-date').value || today();
+  const date  = normalizeDate(document.getElementById('scan-date').value || today());
   const notes = (document.getElementById('manual-notes')?.value || '').trim();
 
   // ---- Duplicate check ----
