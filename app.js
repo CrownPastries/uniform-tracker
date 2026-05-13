@@ -1547,6 +1547,90 @@ function renderReport() {
         </tr>`).join('') : '<tr><td colspan="3" style="text-align:center;color:var(--text3);padding:30px">No issues reported.</td></tr>'}</tbody>
       </table></div>`;
 
+  // ---- CINTAS RETURN WORKFLOW ----
+  } else if (currentReport === 'cintas-workflow') {
+    const barcodes = [...new Set(txns.map(t => t.barcode))];
+    const workflowItems = [];
+
+    barcodes.forEach(bc => {
+      const allTxns = txns.filter(t => t.barcode === bc).sort((a, b) => new Date(a.date) - new Date(b.date));
+      if (!allTxns.length) return;
+
+      // Find each step in the workflow
+      const distributed = allTxns.find(t => t.action === 'distributed');
+      const returned = allTxns.find(t => t.action === 'returned');
+      const sentToCintas = allTxns.find(t => t.action === 'sent_to_cintas');
+
+      // Only show if has distributed step or is heading to Cintas
+      if (!distributed && !sentToCintas) return;
+
+      const emp = distributed ? employees.find(e => e.id === distributed.employeeId) : null;
+
+      // Determine workflow status
+      let status = '⚠ Incomplete';
+      let statusColor = 'var(--orange)';
+      if (distributed && returned && sentToCintas) {
+        status = '✓ Complete';
+        statusColor = 'var(--green)';
+      } else if (distributed && returned) {
+        status = '→ Ready for Cintas';
+        statusColor = 'var(--blue)';
+      } else if (distributed && !returned) {
+        status = '⏳ With Employee';
+        statusColor = 'var(--yellow)';
+      } else if (sentToCintas) {
+        status = '✓ At Cintas';
+        statusColor = 'var(--purple)';
+      }
+
+      if (!inRange(distributed?.date || sentToCintas?.date || '')) return;
+      if (q && !bc.toLowerCase().includes(q) && 
+           !(emp?.firstName?.toLowerCase().includes(q) || false) &&
+           !(emp?.lastName?.toLowerCase().includes(q) || false)) return;
+
+      workflowItems.push({
+        barcode: bc,
+        status,
+        statusColor,
+        distributedDate: distributed?.date || '—',
+        distributedEmp: emp ? `${emp.firstName} ${emp.lastName}` : '—',
+        returnedDate: returned?.date || '—',
+        sentToCintasDate: sentToCintas?.date || '—',
+        isComplete: !!(distributed && returned && sentToCintas),
+        isReadyForCintas: !!(distributed && returned && !sentToCintas),
+        lastAction: allTxns[allTxns.length - 1]?.action
+      });
+    });
+
+    workflowItems.sort((a, b) => {
+      // Prioritize incomplete items
+      if (a.isComplete !== b.isComplete) return a.isComplete ? 1 : -1;
+      if (a.isReadyForCintas !== b.isReadyForCintas) return a.isReadyForCintas ? -1 : 1;
+      return a.barcode.localeCompare(b.barcode);
+    });
+
+    const complete = workflowItems.filter(i => i.isComplete).length;
+    const readyForCintas = workflowItems.filter(i => i.isReadyForCintas).length;
+    const incomplete = workflowItems.filter(i => !i.isComplete && !i.isReadyForCintas).length;
+
+    container.innerHTML = `
+      <div class="report-summary">
+        <div class="rs-card"><div class="rs-num" style="color:var(--green)">${complete}</div><div class="rs-label">Complete Workflow</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--blue)">${readyForCintas}</div><div class="rs-label">Ready for Cintas</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--orange)">${incomplete}</div><div class="rs-label">Incomplete</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--text2)">${workflowItems.length}</div><div class="rs-label">Total Items</div></div>
+      </div>
+      <div class="report-table-wrap"><table class="report-table" style="font-size:0.9rem">
+        <thead><tr><th>Barcode</th><th>Status</th><th>Distributed (Date / Employee)</th><th>Returned (Date)</th><th>Sent to Cintas (Date)</th></tr></thead>
+        <tbody>${workflowItems.length ? workflowItems.map(item => `<tr style="background:${item.status.includes('✓') ? 'rgba(34,197,94,0.05)' : item.status.includes('→') ? 'rgba(59,130,246,0.05)' : 'rgba(249,115,22,0.05)'}">
+          <td class="bc-mono"><strong>${escHtml(item.barcode)}</strong></td>
+          <td><span class="report-badge" style="background:${item.statusColor}; color:white; padding:4px 8px; border-radius:4px; font-size:0.85rem">${item.status}</span></td>
+          <td><small>${formatDate(item.distributedDate)}<br><em style="color:var(--text3)">${escHtml(item.distributedEmp)}</em></small></td>
+          <td><small>${item.returnedDate === '—' ? '<em style="color:var(--text3)">Pending...</em>' : formatDate(item.returnedDate)}</small></td>
+          <td><small>${item.sentToCintasDate === '—' ? '<em style="color:var(--text3)">Pending...</em>' : formatDate(item.sentToCintasDate)}</small></td>
+        </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:30px">No workflow data found.</td></tr>'}</tbody>
+      </table></div>`;
+
   // ---- BY EMPLOYEE ----
   } else if (currentReport === 'employee-summary') {
     const empList = employees.filter(e => !q || `${e.firstName} ${e.lastName}`.toLowerCase().includes(q) || (e.employeeId||'').toLowerCase().includes(q));
