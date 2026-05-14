@@ -63,6 +63,11 @@ const IDB = {
   },
   saveTransaction(txn) {
     return new Promise((resolve, reject) => {
+      // Ensure transaction has an ID (objectStore 'transactions' uses keyPath 'id')
+      if (!txn.id) {
+        txn.id = uid();
+        console.warn('Assigned missing id to transaction before saving to IndexedDB', txn);
+      }
       const tx = this.db.transaction('transactions', 'readwrite');
       const req = tx.objectStore('transactions').put(txn);
       req.onsuccess = () => resolve();
@@ -214,6 +219,12 @@ const CloudSync = {
         return; 
       }
       
+      // Debug: Log employee and transaction data from Google Sheets
+      console.log('Google Sheets employee data:', data.employees);
+      console.log('Employee count from Google Sheets:', (data.employees || []).length);
+      console.log('Google Sheets transactions:', data.transactions);
+      console.log('Transaction count from Google Sheets:', (data.transactions || []).length);
+      
       // Track changes for notification
       let hasChanges = false;
       const oldEmployeeCount = DB.employees.length;
@@ -238,11 +249,14 @@ const CloudSync = {
       if (data.transactions) {
         data.transactions = data.transactions.map(t => ({
           ...t,
+          id: t.id || uid(),
+          action: String(t.action || ''),
           barcode: String(t.barcode || ''),
           employeeName: String(t.employeeName || ''),
           uniformType: String(t.uniformType || ''),
           notes: String(t.notes || ''),
-          date: normalizeDate(t.date)
+          date: normalizeDate(t.date),
+          createdAt: t.createdAt || new Date().toISOString()
         }));
       }
       
@@ -277,10 +291,17 @@ const CloudSync = {
         
         // Save merged transactions
         DB_MEMORY.transactions = mergedTxns.sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
-        
+
         // Update IndexedDB
         await IDB.clearTransactions();
-        for (const t of DB_MEMORY.transactions) await IDB.saveTransaction(t);
+        for (const t of DB_MEMORY.transactions) {
+          try {
+            await IDB.saveTransaction(t);
+          } catch (err) {
+            console.error('Failed saving transaction to IndexedDB:', err, 'Transaction object:', t);
+            // Continue saving others — we'll still report a pull error after loop
+          }
+        }
         
         if (data.transactions.length !== oldTransactionCount) hasChanges = true;
       }
@@ -864,8 +885,9 @@ function renderDashboard() {
   }
   container.innerHTML = txns.map(t => {
     const emp     = t.employeeId ? DB.employees.find(e => e.id === t.employeeId) : null;
+    const actionKey = t.action || '';
     const empName = emp ? `${emp.firstName} ${emp.lastName}` :
-                    (t.action.includes('cintas') || t.action === 'reported_issue' ? 'Cintas' : 'Warehouse');
+                    (actionKey.includes('cintas') || actionKey === 'reported_issue' ? 'Cintas' : 'Warehouse');
     return `<div class="activity-item">
       <span class="activity-dot ${t.action}"></span>
       <div class="activity-info">
@@ -881,6 +903,9 @@ function renderDashboard() {
 // EMPLOYEES
 // ============================================================
 function renderEmployeeList() {
+  console.log('Rendering employee list. DB.employees:', DB.employees);
+  console.log('Employee count in DB:', DB.employees.length);
+  
   const query = (document.getElementById('emp-search')?.value || '').toLowerCase();
   const list  = DB.employees.filter(e =>
     !query || e.firstName?.toLowerCase().includes(query) ||
@@ -888,6 +913,9 @@ function renderEmployeeList() {
     e.employeeId?.toLowerCase().includes(query) ||
     e.productionCentre?.toLowerCase().includes(query)
   );
+  
+  console.log('Filtered employee list:', list);
+  console.log('Filtered employee count:', list.length);
   const container = document.getElementById('employee-list');
   const canEdit = canManageEmployees();
   const addButton = document.querySelector('#page-employees .btn-primary');
@@ -1002,20 +1030,43 @@ function deleteEmployee(id) {
 function showEmployeeDetail(id) {
   const e = DB.employees.find(emp => emp.id === id);
   if (!e) return;
+  
   document.getElementById('emp-detail-name').textContent = `${e.firstName} ${e.lastName}`;
-  document.getElementById('emp-detail-info').innerHTML = [
-    ['Employee ID', e.employeeId||'—'],['Production Centre', e.productionCentre||'—'],
-    ['Department', e.department||'—'],['Phone', e.phone||'—'],['Notes', e.notes||'—']
-  ].map(([l,v]) => `<div class="emp-detail-field"><label>${l}</label><span>${escHtml(v)}</span></div>`).join('');
+  
+  const txns = DB.transactions.filter(t => t.employeeId === id);
+  const myBarcodes = [...new Set(txns.map(t => t.barcode))];
+  const held = myBarcodes.filter(bc => { 
+    const last = txns.filter(t => t.barcode === bc).sort((a,b) => new Date(b.date) - new Date(a.date))[0];
+    return last && last.action === 'distributed'; 
+  }).length;
+  
+  document.getElementById('emp-detail-info').innerHTML = `
+    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap:12px; margin-bottom:20px">
+      <div class="emp-detail-field" style="background:rgba(59,130,246,0.05); padding:12px; border-radius:8px">
+        <label style="font-weight:600; color:var(--blue)">Uniforms On Hold</label>
+        <span style="font-size:1.8rem; font-weight:bold; color:var(--blue)">${held}</span>
+      </div>
+      <div class="emp-detail-field" style="background:rgba(107,114,128,0.05); padding:12px; border-radius:8px">
+        <label style="font-weight:600; color:var(--text2)">Total Uniforms</label>
+        <span style="font-size:1.8rem; font-weight:bold; color:var(--text2)">${myBarcodes.length}</span>
+      </div>
+    </div>
+    ${[
+      ['Employee ID', e.employeeId||'—'],
+      ['Production Centre', e.productionCentre||'—'],
+      ['Department', e.department||'—'],
+      ['Phone', e.phone||'—'],
+      ['Notes', e.notes||'—']
+    ].map(([l,v]) => `<div class="emp-detail-field"><label>${l}</label><span>${escHtml(v)}</span></div>`).join('')}
+  `;
 
-  const txns     = DB.transactions.filter(t => t.employeeId === id);
   const detailEl = document.getElementById('emp-detail-uniforms');
   if (!txns.length) {
     detailEl.innerHTML = '<div class="empty-state"><p>No uniform transactions found for this employee.</p></div>';
   } else {
     detailEl.innerHTML = `<div class="report-table-wrap"><table class="report-table">
       <thead><tr><th>Barcode</th><th>Action</th><th>Date</th><th>Notes</th></tr></thead>
-      <tbody>${txns.map(t => `<tr>
+      <tbody>${txns.sort((a,b) => new Date(b.date) - new Date(a.date)).map(t => `<tr>
         <td class="bc-mono">${escHtml(t.barcode)}</td>
         <td><span class="report-badge ${t.action==='distributed'?'out':t.action==='returned'?'returned':t.action==='reported_issue'?'issue':'cintas'}">${actionLabel(t.action)}</span></td>
         <td>${formatDate(t.date)}</td>
@@ -1404,7 +1455,8 @@ function manualSubmit() {
 
 function updateScanFeed(txn) {
   const feed    = document.getElementById('scan-feed');
-  const empStr  = txn.employeeName || (txn.action === 'reported_issue' ? 'Issue → Cintas' : txn.action.includes('cintas') ? 'Cintas' : 'Warehouse');
+  const actionKey = txn.action || '';
+  const empStr  = txn.employeeName || (actionKey === 'reported_issue' ? 'Issue → Cintas' : actionKey.includes('cintas') ? 'Cintas' : 'Warehouse');
   const empty   = feed.querySelector('.empty-state');
   if (empty) empty.remove();
   const item = document.createElement('div');
@@ -1842,7 +1894,7 @@ function renderReport() {
           <td>${formatDate(t.date)}</td>
           <td class="bc-mono">${escHtml(t.barcode)}</td>
           <td><span class="report-badge ${t.action==='distributed'?'out':t.action==='returned'?'returned':t.action==='reported_issue'?'issue':t.action==='sent_to_cintas'?'cintas':'warehouse'}">${actionLabel(t.action)}</span></td>
-          <td>${escHtml(t.employeeName||(t.action==='reported_issue'?'Issue → Cintas':t.action.includes('cintas')?'Cintas':'Warehouse'))}</td>
+          <td>${escHtml(t.employeeName||(t.action==='reported_issue'?'Issue → Cintas':(t.action||'').includes('cintas')?'Cintas':'Warehouse'))}</td>
           <td>${escHtml(t.notes||'')}</td>
           ${canDelete ? `<td><button class="btn-text" style="color:var(--red)" onclick="deleteTransaction('${t.id}')">Delete</button></td>` : ''}
         </tr>`).join('') : '<tr><td colspan="' + (canDelete ? '6' : '5') + '" style="text-align:center;color:var(--text3);padding:30px">No transactions found.</td></tr>'}</tbody>
@@ -2056,23 +2108,37 @@ function importJSON(event) {
   reader.onload = (e) => {
     try {
       const data = JSON.parse(e.target.result);
+      console.log('Import data parsed:', data);
+      console.log('Employees in import:', data.employees);
+      console.log('Transactions in import:', data.transactions);
       confirm_dialog('Import Backup?','This will REPLACE all current data. Are you sure?', async () => {
-        if (data.employees)    DB.saveEmployees(data.employees);
+        if (data.employees) {
+          console.log('Saving employees:', data.employees);
+          DB.saveEmployees(data.employees);
+        }
         if (data.centres)      DB.saveCentres(data.centres);
         if (data.uniformTypes) DB.saveTypes(data.uniformTypes);
         
         if (data.transactions) {
+          console.log('Clearing transactions and saving:', data.transactions);
           await IDB.clearTransactions();
           DB_MEMORY.transactions = data.transactions;
           for (const t of data.transactions) {
-            await IDB.saveTransaction(t);
+            try {
+              await IDB.saveTransaction(t);
+            } catch (err) {
+              console.error('Failed saving transaction during import:', err, 'Transaction:', t);
+            }
           }
         }
         
         showToast('Backup imported!', 'success');
         renderSettings(); renderDashboard();
       });
-    } catch { showToast('Invalid backup file.', 'error'); }
+    } catch (parseError) {
+      console.error('JSON parse error:', parseError);
+      showToast('Invalid backup file.', 'error');
+    }
   };
   reader.readAsText(file);
   event.target.value = '';
