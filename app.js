@@ -220,9 +220,9 @@ const CloudSync = {
       }
       
       // Debug: Log employee and transaction data from Google Sheets
-      console.log('Google Sheets employee data:', data.employees);
+      console.log('Google Sheets employee data (first 3):', (data.employees || []).slice(0, 3));
       console.log('Employee count from Google Sheets:', (data.employees || []).length);
-      console.log('Google Sheets transactions:', data.transactions);
+      console.log('Google Sheets transactions (first 3):', (data.transactions || []).slice(0, 3));
       console.log('Transaction count from Google Sheets:', (data.transactions || []).length);
       
       // Track changes for notification
@@ -266,17 +266,29 @@ const CloudSync = {
       }
       
       if (data.transactions) {
-        data.transactions = data.transactions.map(t => ({
-          ...t,
-          id: t.id || uid(),
-          action: String(t.action || ''),
-          barcode: String(t.barcode || ''),
-          employeeName: String(t.employeeName || ''),
-          uniformType: String(t.uniformType || ''),
-          notes: String(t.notes || ''),
-          date: normalizeDate(t.date),
-          createdAt: t.createdAt || new Date().toISOString()
-        }));
+        console.log('Raw transaction data from Google Sheets:', data.transactions.slice(0, 3));
+        data.transactions = data.transactions.map((t, idx) => {
+          const raw = t || {};
+          const normalized = {
+            ...raw,
+            id: String(raw.id || raw.transactionId || raw.txnId || '') || uid(),
+            action: normalizeRemoteAction(raw.action || raw.Action || raw.actionLabel || raw.ActionLabel),
+            barcode: String(raw.barcode || raw.Barcode || ''),
+            employeeId: String(raw.employeeId || raw.employeeID || raw['Employee ID'] || raw.employee_id || ''),
+            employeeName: String(raw.employeeName || raw['Employee Name'] || raw.name || raw.Name || ''),
+            uniformType: String(raw.uniformType || raw['Uniform Type'] || ''),
+            notes: String(raw.notes || raw.Notes || ''),
+            date: normalizeDate(raw.date || raw.Date || ''),
+            createdAt: raw.createdAt || raw.created_at || new Date().toISOString()
+          };
+          if (idx < 3) {
+            console.log(`Normalized transaction ${idx}:`, normalized);
+            console.log(`  Raw action: "${raw.action}" / "${raw.Action}" / "${raw.actionLabel}" / "${raw.ActionLabel}" => "${normalized.action}"`);
+            console.log(`  Raw barcode: "${raw.barcode}" / "${raw.Barcode}" => "${normalized.barcode}"`);
+          }
+          return normalized;
+        });
+        console.log('Total normalized transactions:', data.transactions.length);
       }
       
       // Update config data
@@ -499,6 +511,34 @@ function actionLabel(a) {
     reported_issue:       'Issue/Damaged'
   }[a] || a;
 }
+
+function normalizeRemoteAction(action) {
+  const value = String(action || '').trim().toLowerCase();
+  const map = {
+    distributed: 'distributed',
+    returned: 'returned',
+    'soil bin collection': 'collected_from_soil_bin',
+    collected_from_soil_bin: 'collected_from_soil_bin',
+    'sent to cintas': 'sent_to_cintas',
+    sent_to_cintas: 'sent_to_cintas',
+    '→ cintas': 'sent_to_cintas',
+    'received from cintas': 'received_from_cintas',
+    received_from_cintas: 'received_from_cintas',
+    '← cintas': 'received_from_cintas',
+    'reported issue': 'reported_issue',
+    reported_issue: 'reported_issue',
+    'issue/damaged': 'reported_issue',
+    issue: 'reported_issue',
+    damaged: 'reported_issue'
+  };
+  return map[value] || String(action || '').trim();
+}
+
+function findEmployeeByIdOrExternal(id) {
+  if (!id) return null;
+  return DB.employees.find(e => e.id === id || e.employeeId === id);
+}
+
 function escHtml(s) {
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
@@ -543,10 +583,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Employees
     let empData = await IDB.get('ut_employees');
     if (!empData && lsEmployees) { empData = JSON.parse(lsEmployees); hasMigratedAny = true; }
-    if (empData) DB_MEMORY.employees = empData;
+    if (empData) {
+      DB_MEMORY.employees = empData;
+      console.log('Loaded employees from IndexedDB:', DB_MEMORY.employees.length, 'records');
+      if (DB_MEMORY.employees.length > 0) {
+        console.log('First employee:', DB_MEMORY.employees[0]);
+      }
+    }
     
     // Transactions (Optimized Record-Based Storage)
     let txData = await IDB.getAllTransactions();
+    console.log('Loaded transactions from IndexedDB (record store):', txData.length, 'records');
+    if (txData.length > 0) {
+      console.log('First 3 transactions:', txData.slice(0, 3));
+    }
     // Migration from old array-based store if detected
     const legacyTxData = await IDB.get('ut_transactions');
     if (legacyTxData && legacyTxData.length > 0) {
@@ -571,6 +621,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     // Sort transactions by date (newest first)
     DB_MEMORY.transactions = txData.sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
+    console.log('After init, DB.transactions:', DB.transactions.length, 'total');
+    if (DB.transactions.length > 0) {
+      console.log('First 3 transactions in DB_MEMORY:', DB.transactions.slice(0, 3).map(t => ({
+        id: t.id,
+        action: t.action,
+        barcode: t.barcode,
+        employeeId: t.employeeId,
+        createdAt: t.createdAt
+      })));
+    }
     
     // Centres
     let cenData = await IDB.get('ut_centres');
@@ -874,16 +934,29 @@ function showPage(page) {
 // ============================================================
 function computeStats() {
   const txns     = DB.transactions;
+  console.log('computeStats: Total transactions in DB:', txns.length);
+  if (txns.length > 0) {
+    console.log('First 3 transactions:', txns.slice(0, 3).map(t => ({
+      action: t.action,
+      barcode: t.barcode,
+      employeeId: t.employeeId
+    })));
+  }
   const barcodes = [...new Set(txns.map(t => t.barcode))];
+  console.log('Unique barcodes:', barcodes.length, barcodes.slice(0, 5));
   let out = 0, cintas = 0, warehouse = 0, issues = 0;
-  barcodes.forEach(bc => {
+  barcodes.forEach((bc, idx) => {
     const last = txns.find(t => t.barcode === bc);
     if (!last) return;
+    if (idx < 3) {
+      console.log(`Barcode ${bc}: action="${last.action}"`);
+    }
     if      (last.action === 'distributed')                                        out++;
     else if (last.action === 'sent_to_cintas')                                     cintas++;
     else if (last.action === 'reported_issue')                                     issues++;
     else if (last.action === 'returned' || last.action === 'received_from_cintas' || last.action === 'collected_from_soil_bin') warehouse++
   });
+  console.log('Stats computed - out:', out, 'cintas:', cintas, 'warehouse:', warehouse, 'issues:', issues);
   return { total: barcodes.length, out, cintas, warehouse, issues };
 }
 
@@ -903,7 +976,7 @@ function renderDashboard() {
     return;
   }
   container.innerHTML = txns.map(t => {
-    const emp     = t.employeeId ? DB.employees.find(e => e.id === t.employeeId) : null;
+    const emp     = findEmployeeByIdOrExternal(t.employeeId);
     const actionKey = t.action || '';
     const empName = emp ? `${emp.firstName} ${emp.lastName}` :
                     (actionKey.includes('cintas') || actionKey === 'reported_issue' ? 'Cintas' : 'Warehouse');
@@ -922,21 +995,26 @@ function renderDashboard() {
 // EMPLOYEES
 // ============================================================
 function renderEmployeeList() {
-  console.log('Rendering employee list. DB.employees:', DB.employees);
-  console.log('Employee count in DB:', DB.employees.length);
+  console.log('renderEmployeeList: DB.employees count:', DB.employees.length);
+  if (DB.employees.length > 0) {
+    console.log('First 3 employees:', DB.employees.slice(0, 3).map(e => ({
+      id: e.id,
+      firstName: e.firstName,
+      lastName: e.lastName,
+      name: e.name,
+      employeeId: e.employeeId
+    })));
+  }
   
   const query = (document.getElementById('emp-search')?.value || '').toLowerCase();
   const list  = DB.employees.filter(e => {
-    console.log('Employee object:', e);
-    console.log('Employee firstName:', e.firstName, 'lastName:', e.lastName, 'name:', e.name);
     const searchText = `${e.firstName || ''} ${e.lastName || ''} ${e.name || ''}`.toLowerCase();
     return !query || searchText.includes(query) ||
     e.employeeId?.toLowerCase().includes(query) ||
     e.productionCentre?.toLowerCase().includes(query)
   });
   
-  console.log('Filtered employee list:', list);
-  console.log('Filtered employee count:', list.length);
+  console.log('Filtered employee list:', list.length);
   const container = document.getElementById('employee-list');
   const canEdit = canManageEmployees();
   const addButton = document.querySelector('#page-employees .btn-primary');
@@ -956,7 +1034,7 @@ function renderEmployeeList() {
     
     const color = avatarColor(fullName);
     const ini   = initials(firstName, lastName) || initials(e.name || '', '');
-    const myBarcodes = [...new Set(txns.filter(t => t.employeeId === e.id).map(t => t.barcode))];
+    const myBarcodes = [...new Set(txns.filter(t => t.employeeId === e.id || t.employeeId === e.employeeId).map(t => t.barcode))];
     const held = myBarcodes.filter(bc => { const l = txns.find(t => t.barcode === bc); return l && l.action === 'distributed'; }).length;
     return `<div class="emp-card" onclick="showEmployeeDetail('${e.id}')">
       <div class="emp-card-header">
@@ -1531,7 +1609,7 @@ function renderReport() {
     barcodes.forEach(bc => {
       const lastTxn = latestTxn(bc);
       if (!lastTxn || lastTxn.action !== 'distributed') return;
-      const emp = employees.find(e => e.id === lastTxn.employeeId);
+      const emp = findEmployeeByIdOrExternal(lastTxn.employeeId);
       const row = {
         barcode: bc,
         employeeId:    lastTxn.employeeId,
@@ -1642,7 +1720,7 @@ function renderReport() {
       // Only show if has distributed step or is heading to Cintas
       if (!distributed && !sentToCintas) return;
 
-      const emp = distributed ? employees.find(e => e.id === distributed.employeeId) : null;
+      const emp = distributed ? findEmployeeByIdOrExternal(distributed.employeeId) : null;
 
       // Determine workflow status
       let status = '⚠ Incomplete';
@@ -1713,7 +1791,7 @@ function renderReport() {
   } else if (currentReport === 'employee-summary') {
     const empList = employees.filter(e => !q || `${e.firstName} ${e.lastName}`.toLowerCase().includes(q) || (e.employeeId||'').toLowerCase().includes(q));
     const rows = empList.map(e => {
-      const myTxns     = txns.filter(t => t.employeeId === e.id);
+      const myTxns     = txns.filter(t => t.employeeId === e.id || t.employeeId === e.employeeId);
       const myBarcodes = [...new Set(myTxns.map(t => t.barcode))];
       const held = myBarcodes.filter(bc => { const l = latestTxn(bc); return l && l.action === 'distributed'; }).length;
       return { e, held, total: myBarcodes.length };
@@ -1818,14 +1896,14 @@ function renderReport() {
 
     // Group by employee
     filteredTxns.filter(t => t.employeeId).forEach(t => {
-      const emp = employees.find(e => e.id === t.employeeId);
+      const emp = findEmployeeByIdOrExternal(t.employeeId);
       const name = emp ? `${emp.firstName} ${emp.lastName}` : 'Unknown';
       stats.byEmployee[name] = (stats.byEmployee[name] || 0) + 1;
     });
 
     // Group by centre
     filteredTxns.filter(t => t.employeeId).forEach(t => {
-      const emp = employees.find(e => e.id === t.employeeId);
+      const emp = findEmployeeByIdOrExternal(t.employeeId);
       const centre = emp?.productionCentre || 'Unknown';
       stats.byCentre[centre] = (stats.byCentre[centre] || 0) + 1;
     });
