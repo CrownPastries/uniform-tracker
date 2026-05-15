@@ -232,16 +232,35 @@ const CloudSync = {
       
       // Normalize data types from Google Sheets (numbers to strings, etc.)
       if (data.employees) {
-        data.employees = data.employees.map(e => ({
-          ...e,
-          firstName: String(e.firstName || ''),
-          lastName: String(e.lastName || ''),
-          employeeId: String(e.employeeId || ''),
-          productionCentre: String(e.productionCentre || ''),
-          department: String(e.department || ''),
-          phone: String(e.phone || ''),
-          notes: String(e.notes || '')
-        }));
+        data.employees = data.employees.map(e => {
+          // Handle both separate firstName/lastName and single name field
+          let firstName = String(e.firstName || '');
+          let lastName = String(e.lastName || '');
+          const name = String(e.name || '');
+          
+          // If we have a name field but no firstName/lastName, split it
+          if (name && (!firstName || !lastName)) {
+            const parts = name.split(' ');
+            if (parts.length >= 2) {
+              firstName = parts[0];
+              lastName = parts.slice(1).join(' ');
+            } else if (parts.length === 1) {
+              firstName = parts[0];
+              lastName = '';
+            }
+          }
+          
+          return {
+            ...e,
+            firstName,
+            lastName,
+            employeeId: String(e.employeeId || ''),
+            productionCentre: String(e.productionCentre || ''),
+            department: String(e.department || ''),
+            phone: String(e.phone || ''),
+            notes: String(e.notes || '')
+          };
+        });
         DB.saveEmployees(data.employees);
         if (data.employees.length !== oldEmployeeCount) hasChanges = true;
       }
@@ -907,12 +926,14 @@ function renderEmployeeList() {
   console.log('Employee count in DB:', DB.employees.length);
   
   const query = (document.getElementById('emp-search')?.value || '').toLowerCase();
-  const list  = DB.employees.filter(e =>
-    !query || e.firstName?.toLowerCase().includes(query) ||
-    e.lastName?.toLowerCase().includes(query) ||
+  const list  = DB.employees.filter(e => {
+    console.log('Employee object:', e);
+    console.log('Employee firstName:', e.firstName, 'lastName:', e.lastName, 'name:', e.name);
+    const searchText = `${e.firstName || ''} ${e.lastName || ''} ${e.name || ''}`.toLowerCase();
+    return !query || searchText.includes(query) ||
     e.employeeId?.toLowerCase().includes(query) ||
     e.productionCentre?.toLowerCase().includes(query)
-  );
+  });
   
   console.log('Filtered employee list:', list);
   console.log('Filtered employee count:', list.length);
@@ -928,14 +949,19 @@ function renderEmployeeList() {
   }
   const txns = DB.transactions;
   container.innerHTML = list.map(e => {
-    const color = avatarColor(e.firstName + e.lastName);
-    const ini   = initials(e.firstName, e.lastName);
+    // Handle both separate firstName/lastName and single name field
+    const firstName = e.firstName || (e.name ? e.name.split(' ')[0] : '');
+    const lastName = e.lastName || (e.name ? e.name.split(' ').slice(1).join(' ') : '');
+    const fullName = firstName && lastName ? `${firstName} ${lastName}` : (e.name || 'Unknown Employee');
+    
+    const color = avatarColor(fullName);
+    const ini   = initials(firstName, lastName) || initials(e.name || '', '');
     const myBarcodes = [...new Set(txns.filter(t => t.employeeId === e.id).map(t => t.barcode))];
     const held = myBarcodes.filter(bc => { const l = txns.find(t => t.barcode === bc); return l && l.action === 'distributed'; }).length;
     return `<div class="emp-card" onclick="showEmployeeDetail('${e.id}')">
       <div class="emp-card-header">
         <div class="emp-avatar" style="background:${color}">${escHtml(ini)}</div>
-        <div><div class="emp-name">${escHtml(e.firstName)} ${escHtml(e.lastName)}</div><div class="emp-id">${escHtml(e.employeeId||'—')}</div></div>
+        <div><div class="emp-name">${escHtml(fullName)}</div><div class="emp-id">${escHtml(e.employeeId||'—')}</div></div>
       </div>
       <div class="emp-tags">
         ${e.productionCentre ? `<span class="emp-tag centre">${escHtml(e.productionCentre)}</span>` : ''}
@@ -2171,7 +2197,7 @@ function clearAllData() {
 // EXCEL / CSV IMPORT
 // ============================================================
 const FIELD_ALIASES = {
-  firstName:        ['first name','firstname','first','given name','prénom','prenom','name'],
+  firstName:        ['first name','firstname','first','given name','prénom','prenom','name','full name','employee name'],
   lastName:         ['last name','lastname','last','surname','family name','nom'],
   employeeId:       ['employee id','emp id','id','badge','badge number','badge no','employee no','emp no'],
   productionCentre: ['production centre','production center','centre','center','plant','site','location'],
@@ -2313,15 +2339,28 @@ function renderPreview() {
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
       <div>Showing first ${Math.min(20,xlRawRows.length)} of <strong>${xlRawRows.length} employees</strong> to be imported. Review and click <strong>Import Employees</strong>.</div>
     </div>`;
-  document.getElementById('xl-preview-body').innerHTML = preview.map(row => `
-    <tr>
-      <td>${escHtml(get(row,'firstName'))}</td>
-      <td>${escHtml(get(row,'lastName'))}</td>
+  document.getElementById('xl-preview-body').innerHTML = preview.map(row => {
+    let first = get(row,'firstName');
+    let last  = get(row,'lastName');
+    
+    // If we have a name field mapped to firstName, split it for preview
+    if (first && !last) {
+      const parts = first.split(' ');
+      if (parts.length >= 2) {
+        first = parts[0];
+        last = parts.slice(1).join(' ');
+      }
+    }
+    
+    return `<tr>
+      <td>${escHtml(first)}</td>
+      <td>${escHtml(last)}</td>
       <td class="bc-mono">${escHtml(get(row,'employeeId'))}</td>
       <td>${escHtml(get(row,'productionCentre'))}</td>
       <td>${escHtml(get(row,'department'))}</td>
       <td>${escHtml(get(row,'phone'))}</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 }
 
 function xlDoImport() {
@@ -2330,8 +2369,18 @@ function xlDoImport() {
   let added = 0, skipped = 0;
 
   xlRawRows.forEach(row => {
-    const first = get(row, 'firstName');
-    const last  = get(row, 'lastName');
+    let first = get(row, 'firstName');
+    let last  = get(row, 'lastName');
+    
+    // If we have a name field mapped to firstName, split it
+    if (first && !last) {
+      const parts = first.split(' ');
+      if (parts.length >= 2) {
+        first = parts[0];
+        last = parts.slice(1).join(' ');
+      }
+    }
+    
     if (!first || !last) { skipped++; return; }
     const emp = {
       id:               uid(),
