@@ -105,7 +105,12 @@ const DB = {
   addUser(u)        { const list = this.users; list.push(u); this.saveUsers(list); },
   addTransaction(t) {
     this.transactions.unshift(t);
-    IDB.saveTransaction(t);
+    // Save to IndexedDB - handle errors gracefully
+    IDB.saveTransaction(t).catch(err => {
+      console.error('Failed to save transaction to IndexedDB:', err, 'Transaction:', t);
+      // Transaction is in memory but failed to persist - show warning
+      showToast('⚠ Transaction saved locally but cloud sync may not work. Check your browser storage.', 'warning');
+    });
   },
   removeTransaction(id) {
     DB_MEMORY.transactions = DB_MEMORY.transactions.filter(t => t.id !== id);
@@ -311,10 +316,16 @@ const CloudSync = {
         const existingTxns = new Map();
         DB_MEMORY.transactions.forEach(t => existingTxns.set(t.id, t));
         
+        // Also create a map for deduplication by barcode+date+action+employee
+        const dedupeKey = (t) => `${t.barcode}|${t.date}|${t.action}|${t.employeeId || ''}`;
+        const dedupeMap = new Map();
+        DB_MEMORY.transactions.forEach(t => dedupeMap.set(dedupeKey(t), t.id));
+        
         // Merge transactions: keep local ones that aren't in cloud, update existing ones
         const mergedTxns = [...DB_MEMORY.transactions]; // Start with local
         
         for (const cloudTxn of data.transactions) {
+          // Check for duplicate by ID first
           const existingIdx = mergedTxns.findIndex(t => t.id === cloudTxn.id);
           if (existingIdx >= 0) {
             // Check if data actually changed
@@ -324,8 +335,17 @@ const CloudSync = {
               hasChanges = true;
             }
           } else {
+            // Check for duplicate by content (barcode+date+action+employee)
+            const dedupKey = dedupeKey(cloudTxn);
+            if (dedupeMap.has(dedupKey)) {
+              // This transaction already exists (possibly with different ID)
+              console.log('Duplicate transaction detected (by content):', dedupKey);
+              continue; // Skip adding it
+            }
+            
             // Add new transaction from cloud
             mergedTxns.push(cloudTxn);
+            dedupeMap.set(dedupKey, cloudTxn.id);
             hasChanges = true;
           }
         }
@@ -661,14 +681,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const legacyTxData = await IDB.get('ut_transactions');
     if (legacyTxData && legacyTxData.length > 0) {
       console.log('Migrating legacy transactions to record-based store...');
-      for (const t of legacyTxData) {
-        if (!t.id) t.id = uid();
-        await IDB.saveTransaction(t);
-        txData.push(t);
-      }
-      IDB.set('ut_transactions', []); // Clear legacy store
+      // Legacy data is already in the record-based store, skip this
+      IDB.set('ut_transactions', []); // Clear legacy marker
       hasMigratedAny = true;
     }
+    
     // Final check for localStorage migration
     if (txData.length === 0 && lsTransactions) {
       const parsed = JSON.parse(lsTransactions);
@@ -679,17 +696,23 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       hasMigratedAny = true;
     }
+    
     // Sort transactions by date (newest first)
     DB_MEMORY.transactions = txData.sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
     
     // Check if we had to repair data - if so, save it back to IndexedDB
+    // BUT: Only repair/re-save if we actually detected corruption (Column X format)
     const hadRepairs = txData && txData.some(t => t['Column 2']); // Check if any still have Column X format
     if (hadRepairs || (empData && empData.some(e => e['Column 2']))) {
       console.log('Saving repaired data back to IndexedDB...');
       await IDB.set('ut_employees', DB_MEMORY.employees);
-      await IDB.clearTransactions();
-      for (const t of DB_MEMORY.transactions) {
-        await IDB.saveTransaction(t);
+      // Only clear and re-save if we detected corruption
+      if (hadRepairs) {
+        console.log('Detected corrupted transaction data, re-saving...');
+        await IDB.clearTransactions();
+        for (const t of DB_MEMORY.transactions) {
+          await IDB.saveTransaction(t);
+        }
       }
       hasMigratedAny = true;
     }
@@ -2296,28 +2319,44 @@ function importJSON(event) {
       console.log('Employees in import:', data.employees);
       console.log('Transactions in import:', data.transactions);
       confirm_dialog('Import Backup?','This will REPLACE all current data. Are you sure?', async () => {
-        if (data.employees) {
-          console.log('Saving employees:', data.employees);
-          DB.saveEmployees(data.employees);
-        }
-        if (data.centres)      DB.saveCentres(data.centres);
-        if (data.uniformTypes) DB.saveTypes(data.uniformTypes);
+        // Temporarily disable auto-sync to prevent conflicts during import
+        stopAutoSync();
         
-        if (data.transactions) {
-          console.log('Clearing transactions and saving:', data.transactions);
-          await IDB.clearTransactions();
-          DB_MEMORY.transactions = data.transactions;
-          for (const t of data.transactions) {
-            try {
-              await IDB.saveTransaction(t);
-            } catch (err) {
-              console.error('Failed saving transaction during import:', err, 'Transaction:', t);
-            }
+        try {
+          if (data.employees) {
+            console.log('Saving employees:', data.employees);
+            DB.saveEmployees(data.employees);
           }
+          if (data.centres)      DB.saveCentres(data.centres);
+          if (data.uniformTypes) DB.saveTypes(data.uniformTypes);
+          
+          if (data.transactions) {
+            console.log('Clearing transactions and saving:', data.transactions.length, 'transactions');
+            await IDB.clearTransactions();
+            
+            // Ensure each transaction has a unique ID
+            const txnsWithIds = data.transactions.map(t => ({
+              ...t,
+              id: t.id || uid()
+            }));
+            
+            DB_MEMORY.transactions = txnsWithIds;
+            for (const t of txnsWithIds) {
+              try {
+                await IDB.saveTransaction(t);
+              } catch (err) {
+                console.error('Failed saving transaction during import:', err, 'Transaction:', t);
+              }
+            }
+            console.log('Import complete:', DB_MEMORY.transactions.length, 'transactions saved');
+          }
+          
+          showToast('Backup imported!', 'success');
+          renderSettings(); renderDashboard();
+        } finally {
+          // Resume auto-sync after import is complete
+          startAutoSync();
         }
-        
-        showToast('Backup imported!', 'success');
-        renderSettings(); renderDashboard();
       });
     } catch (parseError) {
       console.error('JSON parse error:', parseError);
