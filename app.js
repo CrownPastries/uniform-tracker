@@ -233,10 +233,11 @@ const CloudSync = {
       // Normalize data types from Google Sheets (numbers to strings, etc.)
       if (data.employees) {
         data.employees = data.employees.map(e => {
-          // Handle both separate firstName/lastName and single name field
-          let firstName = String(e.firstName || '');
-          let lastName = String(e.lastName || '');
-          const name = String(e.name || '');
+          // Handle both mapped field names and raw Google Sheets "Column X" format
+          let firstName = String(e.firstName || e['Column 2'] || '').trim();
+          let lastName = String(e.lastName || e['Column 3'] || '').trim();
+          const name = String(e.name || '').trim();
+          const id = String(e.id || e['Column 1'] || uid()).trim();
           
           // If we have a name field but no firstName/lastName, split it
           if (name && (!firstName || !lastName)) {
@@ -251,14 +252,15 @@ const CloudSync = {
           }
           
           return {
-            ...e,
+            id,
             firstName,
             lastName,
-            employeeId: String(e.employeeId || ''),
-            productionCentre: String(e.productionCentre || ''),
-            department: String(e.department || ''),
-            phone: String(e.phone || ''),
-            notes: String(e.notes || '')
+            employeeId: String(e.employeeId || e['Column 4'] || '').trim(),
+            productionCentre: String(e.productionCentre || e['Column 5'] || '').trim(),
+            department: String(e.department || e['Column 6'] || '').trim(),
+            phone: String(e.phone || e['Column 7'] || '').trim(),
+            notes: String(e.notes || e['Column 8'] || '').trim(),
+            createdAt: e.createdAt || e['Column 9'] || new Date().toISOString()
           };
         });
         DB.saveEmployees(data.employees);
@@ -269,22 +271,30 @@ const CloudSync = {
         console.log('Raw transaction data from Google Sheets:', data.transactions.slice(0, 3));
         data.transactions = data.transactions.map((t, idx) => {
           const raw = t || {};
+          
+          // Handle both mapped field names and raw Google Sheets "Column X" format
+          const id = String(raw.id || raw['Column 1'] || raw.transactionId || raw.txnId || uid()).trim();
+          const barcode = String(raw.barcode || raw.Barcode || raw['Column 2'] || '').trim();
+          const action = normalizeRemoteAction(raw.action || raw.Action || raw.actionLabel || raw.ActionLabel || raw['Column 3'] || '');
+          const date = normalizeDate(raw.date || raw.Date || raw['Column 8'] || raw['Column 7'] || '');
+          const createdAt = raw.createdAt || raw.created_at || raw['Column 9'] || new Date().toISOString();
+          
           const normalized = {
-            ...raw,
-            id: String(raw.id || raw.transactionId || raw.txnId || '') || uid(),
-            action: normalizeRemoteAction(raw.action || raw.Action || raw.actionLabel || raw.ActionLabel),
-            barcode: String(raw.barcode || raw.Barcode || ''),
-            employeeId: String(raw.employeeId || raw.employeeID || raw['Employee ID'] || raw.employee_id || ''),
-            employeeName: String(raw.employeeName || raw['Employee Name'] || raw.name || raw.Name || ''),
-            uniformType: String(raw.uniformType || raw['Uniform Type'] || ''),
-            notes: String(raw.notes || raw.Notes || ''),
-            date: normalizeDate(raw.date || raw.Date || ''),
-            createdAt: raw.createdAt || raw.created_at || new Date().toISOString()
+            id: id || uid(),
+            action,
+            barcode,
+            employeeId: String(raw.employeeId || raw.employeeID || raw['Employee ID'] || raw.employee_id || raw['Column 4'] || '').trim(),
+            employeeName: String(raw.employeeName || raw['Employee Name'] || raw.name || raw.Name || raw['Column 5'] || '').trim(),
+            uniformType: String(raw.uniformType || raw['Uniform Type'] || raw['Column 6'] || '').trim(),
+            notes: String(raw.notes || raw.Notes || raw['Column 10'] || '').trim(),
+            date,
+            createdAt
           };
+          
           if (idx < 3) {
             console.log(`Normalized transaction ${idx}:`, normalized);
-            console.log(`  Raw action: "${raw.action}" / "${raw.Action}" / "${raw.actionLabel}" / "${raw.ActionLabel}" => "${normalized.action}"`);
-            console.log(`  Raw barcode: "${raw.barcode}" / "${raw.Barcode}" => "${normalized.barcode}"`);
+            console.log(`  Raw cols: Col1="${raw['Column 1']}" Col2="${raw['Column 2']}" Col3="${raw['Column 3']}"`)
+            console.log(`  => id="${normalized.id}" barcode="${normalized.barcode}" action="${normalized.action}"`);
           }
           return normalized;
         });
@@ -584,18 +594,68 @@ document.addEventListener('DOMContentLoaded', async () => {
     let empData = await IDB.get('ut_employees');
     if (!empData && lsEmployees) { empData = JSON.parse(lsEmployees); hasMigratedAny = true; }
     if (empData) {
+      // Repair malformed employee data (from old Google Sheets pulls with Column X format)
+      empData = empData.map(e => {
+        if (!e.firstName && e['Column 2']) {
+          // Data has raw Column X format, needs repair
+          return {
+            id: String(e.id || e['Column 1'] || uid()).trim(),
+            firstName: String(e['Column 2'] || '').trim(),
+            lastName: String(e['Column 3'] || '').trim(),
+            employeeId: String(e['Column 4'] || '').trim(),
+            productionCentre: String(e['Column 5'] || '').trim(),
+            department: String(e['Column 6'] || '').trim(),
+            phone: String(e['Column 7'] || '').trim(),
+            notes: String(e['Column 8'] || '').trim(),
+            createdAt: e['Column 9'] || e.createdAt || new Date().toISOString()
+          };
+        }
+        return e; // Already properly formatted
+      });
       DB_MEMORY.employees = empData;
-      console.log('Loaded employees from IndexedDB:', DB_MEMORY.employees.length, 'records');
+      // Re-save the repaired data
+      await IDB.set('ut_employees', empData);
+      hasMigratedAny = true;
+      console.log('Repaired employees from IndexedDB:', DB_MEMORY.employees.length, 'records');
       if (DB_MEMORY.employees.length > 0) {
-        console.log('First employee:', DB_MEMORY.employees[0]);
+        console.log('First employee after repair:', DB_MEMORY.employees[0]);
       }
     }
     
     // Transactions (Optimized Record-Based Storage)
     let txData = await IDB.getAllTransactions();
     console.log('Loaded transactions from IndexedDB (record store):', txData.length, 'records');
+    
+    // Repair malformed transaction data (from old Google Sheets pulls with Column X format)
+    txData = txData.map((t, idx) => {
+      if (!t.barcode && t['Column 2']) {
+        // Data has raw Column X format, needs repair
+        const repaired = {
+          id: String(t.id || t['Column 1'] || uid()).trim(),
+          action: normalizeRemoteAction(t['Column 3'] || ''),
+          barcode: String(t['Column 2'] || '').trim(),
+          employeeId: String(t['Column 4'] || '').trim(),
+          employeeName: String(t['Column 5'] || '').trim(),
+          uniformType: String(t['Column 6'] || '').trim(),
+          notes: String(t['Column 10'] || '').trim(),
+          date: normalizeDate(t['Column 8'] || t['Column 7'] || ''),
+          createdAt: t['Column 9'] || t.createdAt || new Date().toISOString()
+        };
+        if (idx < 3) {
+          console.log(`Repaired transaction ${idx}:`, repaired);
+        }
+        return repaired;
+      }
+      return t; // Already properly formatted
+    });
+    
     if (txData.length > 0) {
-      console.log('First 3 transactions:', txData.slice(0, 3));
+      console.log('First 3 transactions after repair:', txData.slice(0, 3).map(t => ({
+        id: t.id,
+        action: t.action,
+        barcode: t.barcode,
+        createdAt: t.createdAt
+      })));
     }
     // Migration from old array-based store if detected
     const legacyTxData = await IDB.get('ut_transactions');
@@ -621,6 +681,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     // Sort transactions by date (newest first)
     DB_MEMORY.transactions = txData.sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
+    
+    // Check if we had to repair data - if so, save it back to IndexedDB
+    const hadRepairs = txData && txData.some(t => t['Column 2']); // Check if any still have Column X format
+    if (hadRepairs || (empData && empData.some(e => e['Column 2']))) {
+      console.log('Saving repaired data back to IndexedDB...');
+      await IDB.set('ut_employees', DB_MEMORY.employees);
+      await IDB.clearTransactions();
+      for (const t of DB_MEMORY.transactions) {
+        await IDB.saveTransaction(t);
+      }
+      hasMigratedAny = true;
+    }
+    
     console.log('After init, DB.transactions:', DB.transactions.length, 'total');
     if (DB.transactions.length > 0) {
       console.log('First 3 transactions in DB_MEMORY:', DB.transactions.slice(0, 3).map(t => ({
@@ -683,6 +756,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   } catch (e) {
     console.error("IndexedDB Intialization failed, running empty defaults.", e);
+    // Ensure users are initialized with defaults even if IndexedDB fails
+    DB_MEMORY.users = [
+      { username: 'Admin', password: 'Admin1980', role: 'admin' },
+      { username: 'Operator', password: 'Oper1234', role: 'operator' },
+      { username: 'Warehouse', password: 'Wh1234', role: 'warehouse' },
+      { username: 'Manager', password: 'Manager123', role: 'manager' }
+    ];
   }
 
   // Auth Bootloader Check
@@ -1010,8 +1090,8 @@ function renderEmployeeList() {
   const list  = DB.employees.filter(e => {
     const searchText = `${e.firstName || ''} ${e.lastName || ''} ${e.name || ''}`.toLowerCase();
     return !query || searchText.includes(query) ||
-    e.employeeId?.toLowerCase().includes(query) ||
-    e.productionCentre?.toLowerCase().includes(query)
+    (e.employeeId && String(e.employeeId).toLowerCase().includes(query)) ||
+    (e.productionCentre && String(e.productionCentre).toLowerCase().includes(query))
   });
   
   console.log('Filtered employee list:', list.length);
@@ -1284,8 +1364,8 @@ function showEmpDropdown() {
   const employees = DB.employees;
   const filtered  = query ? employees.filter(e =>
     `${e.firstName} ${e.lastName}`.toLowerCase().includes(query) ||
-    (e.employeeId||'').toLowerCase().includes(query) ||
-    (e.productionCentre||'').toLowerCase().includes(query)
+    String(e.employeeId||'').toLowerCase().includes(query) ||
+    String(e.productionCentre||'').toLowerCase().includes(query)
   ) : employees;
 
   dd.innerHTML = !filtered.length
@@ -1623,10 +1703,10 @@ function renderReport() {
       };
       if (from && lastTxn.date < from) return;
       if (to   && lastTxn.date > to)   return;
-      if (q && !bc.toLowerCase().includes(q) &&
-               !row.employeeName.toLowerCase().includes(q) &&
-               !row.centre.toLowerCase().includes(q) &&
-               !row.employeeEmpId.toLowerCase().includes(q)) return;
+      if (q && !String(bc).toLowerCase().includes(q) &&
+               !String(row.employeeName).toLowerCase().includes(q) &&
+               !String(row.centre).toLowerCase().includes(q) &&
+               !String(row.employeeEmpId).toLowerCase().includes(q)) return;
       missingItems.push(row);
     });
 
@@ -1687,7 +1767,7 @@ function renderReport() {
       const last = latestTxn(bc);
       if (!last || last.action !== 'reported_issue') return;
       if (!inRange(last.date)) return;
-      if (q && !bc.toLowerCase().includes(q)) return;
+      if (q && !String(bc).toLowerCase().includes(q)) return;
       rows.push({ barcode: bc, date: last.date, notes: last.notes || '' });
     });
     container.innerHTML = `
@@ -1740,9 +1820,9 @@ function renderReport() {
       }
 
       if (!inRange(distributed?.date || sentToCintas?.date || '')) return;
-      if (q && !bc.toLowerCase().includes(q) && 
-           !(emp?.firstName?.toLowerCase().includes(q) || false) &&
-           !(emp?.lastName?.toLowerCase().includes(q) || false)) return;
+      if (q && !String(bc).toLowerCase().includes(q) && 
+           !(emp?.firstName && String(emp.firstName).toLowerCase().includes(q)) &&
+           !(emp?.lastName && String(emp.lastName).toLowerCase().includes(q))) return;
 
       workflowItems.push({
         barcode: bc,
@@ -1789,7 +1869,7 @@ function renderReport() {
 
   // ---- BY EMPLOYEE ----
   } else if (currentReport === 'employee-summary') {
-    const empList = employees.filter(e => !q || `${e.firstName} ${e.lastName}`.toLowerCase().includes(q) || (e.employeeId||'').toLowerCase().includes(q));
+    const empList = employees.filter(e => !q || `${e.firstName} ${e.lastName}`.toLowerCase().includes(q) || String(e.employeeId||'').toLowerCase().includes(q));
     const rows = empList.map(e => {
       const myTxns     = txns.filter(t => t.employeeId === e.id || t.employeeId === e.employeeId);
       const myBarcodes = [...new Set(myTxns.map(t => t.barcode))];
@@ -1821,7 +1901,7 @@ function renderReport() {
       const last = latestTxn(bc);
       if (!last || (last.action !== 'sent_to_cintas' && last.action !== 'reported_issue')) return;
       if (!inRange(last.date)) return;
-      if (q && !bc.toLowerCase().includes(q)) return;
+      if (q && !String(bc).toLowerCase().includes(q)) return;
       rows.push({ barcode: bc, date: last.date, how: last.action, days: Math.floor((Date.now()-new Date(last.date))/86400000), notes: last.notes||'' });
     });
     container.innerHTML = `
@@ -1848,7 +1928,7 @@ function renderReport() {
       const last = latestTxn(bc);
       if (!last || (last.action !== 'returned' && last.action !== 'received_from_cintas' && last.action !== 'collected_from_soil_bin' && last.action !== 'collected_from_soil_bin')) return;
       if (!inRange(last.date)) return;
-      if (q && !bc.toLowerCase().includes(q)) return;
+      if (q && !String(bc).toLowerCase().includes(q)) return;
       const howDisplay = last.action === 'collected_from_soil_bin' ? 'Collected from Soil Bin' : 
                          last.action === 'returned' ? 'Returned' : 
                          'Received from Cintas';
@@ -1989,7 +2069,7 @@ function renderReport() {
   // ---- BARCODE TIMELINE ----
   } else if (currentReport === 'barcode-history') {
     let filteredTxns = txns.filter(t => inRange(t.date));
-    if (q) filteredTxns = filteredTxns.filter(t => t.barcode.toLowerCase().includes(q) || (t.employeeName||'').toLowerCase().includes(q));
+    if (q) filteredTxns = filteredTxns.filter(t => String(t.barcode).toLowerCase().includes(q) || String(t.employeeName||'').toLowerCase().includes(q));
     const canDelete = canDeleteTransactions();
     container.innerHTML = `
       <div class="report-table-wrap"><table class="report-table">
