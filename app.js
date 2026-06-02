@@ -476,9 +476,17 @@ let _realtimeChannel = null;
 
 function getSupabase() {
   if (_supabaseClient) return _supabaseClient;
-  const url = localStorage.getItem('ut_cloud_url') || '';
-  const key = localStorage.getItem('ut_cloud_key') || '';
-  if (!url || !key) return null;
+  let url = localStorage.getItem('ut_cloud_url') || '';
+  let key = localStorage.getItem('ut_cloud_key') || '';
+  
+  // Default fallback credentials to ensure it connects instantly on fresh load
+  if (!url || !key) {
+    url = 'https://ruhovbdcnnukvobbejor.supabase.co';
+    key = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ1aG92YmRjbm51a3ZvYmJlam9yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAwMTc5NzksImV4cCI6MjA5NTU5Mzk3OX0.Yx769_aDtIdQhiiYuaDCcAq05QZPaCAhBpOxMrWm7Jc';
+    localStorage.setItem('ut_cloud_url', url);
+    localStorage.setItem('ut_cloud_key', key);
+  }
+
   try {
     _supabaseClient = window.supabase.createClient(url, key);
     return _supabaseClient;
