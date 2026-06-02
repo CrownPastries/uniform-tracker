@@ -813,31 +813,63 @@ function startRealtimeSubscription() {
   try {
     _realtimeChannel = sb
       .channel('unitrack-realtime')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'transactions' }, async (payload) => {
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'transactions' }, async (payload) => {
+        const type = payload.eventType;
+        if (type === 'DELETE') {
+          const oldRow = payload.old;
+          if (oldRow && oldRow.id) {
+            DB_MEMORY.transactions = DB_MEMORY.transactions.filter(t => t.id !== oldRow.id);
+            IDB.deleteTransaction(oldRow.id).catch(() => {});
+            if (currentPage === 'dashboard') renderDashboard();
+            if (currentPage === 'reports')   renderReport();
+          }
+          return;
+        }
+
         const newRow = payload.new;
         if (!newRow) return;
+        
         // Build employee map for name lookup
         const employeeMap = {};
         DB.employees.forEach(e => { employeeMap[e.id] = e; });
         const txn = txnFromSupabase(newRow, employeeMap);
-        // Only add if not already known locally
-        if (!DB_MEMORY.transactions.find(t => t.id === txn.id)) {
+        
+        const idx = DB_MEMORY.transactions.findIndex(t => t.id === txn.id);
+        if (idx >= 0) {
+          DB_MEMORY.transactions[idx] = txn;
+        } else {
           DB_MEMORY.transactions.unshift(txn);
-          IDB.saveTransaction(txn).catch(() => {});
-          if (currentPage === 'dashboard') renderDashboard();
-          if (currentPage === 'reports')   renderReport();
         }
+        
+        IDB.saveTransaction(txn).catch(() => {});
+        if (currentPage === 'dashboard') renderDashboard();
+        if (currentPage === 'reports')   renderReport();
       })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'employees' }, async (payload) => {
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'employees' }, async (payload) => {
+        const type = payload.eventType;
+        if (type === 'DELETE') {
+          const oldRow = payload.old;
+          if (oldRow && oldRow.id) {
+            DB_MEMORY.employees = DB_MEMORY.employees.filter(e => e.id !== oldRow.id);
+            IDB.set('ut_employees', DB_MEMORY.employees);
+            if (currentPage === 'employees') renderEmployeeList();
+          }
+          return;
+        }
+
         const newRow = payload.new;
         if (!newRow) return;
+        
         const emp = empFromSupabase(newRow);
-        if (!DB.employees.find(e => e.id === emp.id)) {
-          const list = DB.employees;
-          list.push(emp);
-          DB.saveEmployees(list);
-          if (currentPage === 'employees') renderEmployeeList();
+        const idx = DB_MEMORY.employees.findIndex(e => e.id === emp.id);
+        if (idx >= 0) {
+          DB_MEMORY.employees[idx] = emp;
+        } else {
+          DB_MEMORY.employees.push(emp);
         }
+        
+        DB.saveEmployees(DB_MEMORY.employees);
+        if (currentPage === 'employees') renderEmployeeList();
       })
       .subscribe((status) => {
         if (status === 'SUBSCRIBED') {
