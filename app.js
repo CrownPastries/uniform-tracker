@@ -1,6 +1,7 @@
 /* ============================================================
-   UniTrack — Application Logic (app.js)
-   Workflow: 1-Receive from Cintas → 2-Distribute/Report Issue → 3-Return → 4-Send to Cintas
+   UniTrack v3 — Application Logic (app.js)
+   Intelligent Uniform Lifecycle Tracking
+   State Machine + Inference Engine
    ============================================================ */
 
 // ============================================================
@@ -52,7 +53,6 @@ const IDB = {
       req.onerror = () => reject(req.error);
     });
   },
-  // New optimized transaction methods
   getAllTransactions() {
     return new Promise((resolve, reject) => {
       const tx = this.db.transaction('transactions', 'readonly');
@@ -63,10 +63,8 @@ const IDB = {
   },
   saveTransaction(txn) {
     return new Promise((resolve, reject) => {
-      // Ensure transaction has an ID (objectStore 'transactions' uses keyPath 'id')
       if (!txn.id) {
         txn.id = uid();
-        console.warn('Assigned missing id to transaction before saving to IndexedDB', txn);
       }
       const tx = this.db.transaction('transactions', 'readwrite');
       const req = tx.objectStore('transactions').put(txn);
@@ -89,6 +87,36 @@ const IDB = {
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error);
     });
+  },
+  async saveTransactionsBulk(txns) {
+    // Write in chunks with a yield between each batch to prevent UI freeze
+    const CHUNK = 500;
+    
+    // First, clear the store
+    await new Promise((resolve, reject) => {
+      const tx = this.db.transaction('transactions', 'readwrite');
+      tx.objectStore('transactions').clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+
+    // Then write chunks, creating a new IDB transaction for each chunk
+    // because IndexedDB transactions automatically close when yielding to setTimeout
+    for (let i = 0; i < txns.length; i += CHUNK) {
+      await new Promise((resolve, reject) => {
+        const tx = this.db.transaction('transactions', 'readwrite');
+        const store = tx.objectStore('transactions');
+        const end = Math.min(i + CHUNK, txns.length);
+        for (let j = i; j < end; j++) {
+          if (!txns[j].id) txns[j].id = uid();
+          store.put(txns[j]);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+      // Yield to the browser
+      await new Promise(r => setTimeout(r, 0));
+    }
   }
 };
 
@@ -105,11 +133,9 @@ const DB = {
   addUser(u)        { const list = this.users; list.push(u); this.saveUsers(list); },
   addTransaction(t) {
     this.transactions.unshift(t);
-    // Save to IndexedDB - handle errors gracefully
     IDB.saveTransaction(t).catch(err => {
-      console.error('Failed to save transaction to IndexedDB:', err, 'Transaction:', t);
-      // Transaction is in memory but failed to persist - show warning
-      showToast('⚠ Transaction saved locally but cloud sync may not work. Check your browser storage.', 'warning');
+      console.error('Failed to save transaction to IndexedDB:', err);
+      showToast('⚠ Transaction saved locally but may not persist. Check storage.', 'warning');
     });
   },
   removeTransaction(id) {
@@ -120,292 +146,610 @@ const DB = {
 };
 
 // ============================================================
-// CLOUD SYNC  (Google Sheets via Apps Script)
+// STATE MACHINE ENGINE
 // ============================================================
+
+// Maps action to the resulting state after that action
+const ACTION_TO_STATE = {
+  received_from_cintas:   'warehouse',
+  distributed:            'with_employee',
+  returned:               'warehouse',
+  collected_from_soil_bin:'soil_bin',
+  sent_to_cintas:         'at_cintas',
+  reported_issue:         'damaged'
+};
+
+// Valid transitions: from state → allowed actions
+// NOTE: Some transitions are intentionally OMITTED so inference logic fires:
+//   - with_employee → collected_from_soil_bin (must infer 'returned' first)
+//   - damaged → received_from_cintas (must infer 'sent_to_cintas' first)
+const VALID_TRANSITIONS = {
+  'unknown':        ['received_from_cintas', 'distributed', 'returned', 'collected_from_soil_bin', 'sent_to_cintas', 'reported_issue'],
+  'warehouse':      ['distributed', 'reported_issue', 'sent_to_cintas', 'collected_from_soil_bin'],
+  'with_employee':  ['returned', 'reported_issue'],
+  'soil_bin':       ['sent_to_cintas'],
+  'at_cintas':      ['received_from_cintas'],
+  'damaged':        ['sent_to_cintas']
+};
+
+// Resolve the current state of a barcode based on its full transaction history
+function resolveState(barcode) {
+  const txns = DB.transactions
+    .filter(t => t.barcode === barcode)
+    .sort((a, b) => {
+      // Sort by date first, then by createdAt for same-date items
+      const dateComp = (a.date || '').localeCompare(b.date || '');
+      if (dateComp !== 0) return dateComp;
+      return new Date(a.createdAt) - new Date(b.createdAt);
+    });
+
+  if (!txns.length) return { state: 'unknown', lastTxn: null, history: [] };
+
+  const lastTxn = txns[txns.length - 1];
+  const state = ACTION_TO_STATE[lastTxn.action] || 'unknown';
+
+  return { state, lastTxn, history: txns };
+}
+
+// Check if a transition is valid and what inferences are needed
+function validateTransition(barcode, newAction, newDate, employeeId) {
+  const { state, lastTxn, history } = resolveState(barcode);
+  const allowed = VALID_TRANSITIONS[state] || VALID_TRANSITIONS['unknown'];
+  const isValid = allowed.includes(newAction);
+  const warnings = [];
+  const inferences = [];
+
+  if (state === 'unknown') {
+    // First time seeing this barcode, any action is OK
+    return { valid: true, warnings: [], inferences: [], currentState: state };
+  }
+
+  if (isValid) {
+    // Direct valid transition, no inference needed
+    return { valid: true, warnings: [], inferences: [], currentState: state };
+  }
+
+  // ---- INFERENCE LOGIC: Try to bridge the gap ----
+
+  // Case: Item is with_employee, action is collected_from_soil_bin
+  // Infer: employee returned to warehouse first
+  if (state === 'with_employee' && newAction === 'collected_from_soil_bin') {
+    inferences.push({
+      action: 'returned',
+      barcode,
+      employeeId: lastTxn.employeeId,
+      employeeName: lastTxn.employeeName,
+      date: newDate,
+      notes: 'Auto-inferred: Employee returned uniform before soil bin collection',
+      inferred: true
+    });
+    return { valid: true, warnings: ['Item was with employee — auto-inferring return step'], inferences, currentState: state };
+  }
+
+  // Case: Item is with_employee, action is sent_to_cintas
+  // Infer: returned + collected from soil bin
+  if (state === 'with_employee' && newAction === 'sent_to_cintas') {
+    inferences.push({
+      action: 'returned',
+      barcode,
+      employeeId: lastTxn.employeeId,
+      employeeName: lastTxn.employeeName,
+      date: newDate,
+      notes: 'Auto-inferred: Employee returned uniform before Cintas send',
+      inferred: true
+    });
+    inferences.push({
+      action: 'collected_from_soil_bin',
+      barcode,
+      employeeId: null,
+      employeeName: null,
+      date: newDate,
+      notes: 'Auto-inferred: Collected from soil bin before Cintas send',
+      inferred: true
+    });
+    return { valid: true, warnings: ['Item was with employee — auto-inferring return + soil bin collection'], inferences, currentState: state };
+  }
+
+  // Case: Item is with_employee, action is received_from_cintas (re-receipt)
+  // Infer: returned + collected from soil bin + sent to cintas
+  if (state === 'with_employee' && newAction === 'received_from_cintas') {
+    const lastDate = lastTxn.date || newDate;
+    const midDate = estimateMidDate(lastDate, newDate);
+
+    inferences.push({
+      action: 'returned',
+      barcode,
+      employeeId: lastTxn.employeeId,
+      employeeName: lastTxn.employeeName,
+      date: midDate,
+      notes: 'Auto-inferred: Employee returned uniform (estimated date)',
+      inferred: true
+    });
+    inferences.push({
+      action: 'collected_from_soil_bin',
+      barcode,
+      employeeId: null,
+      employeeName: null,
+      date: midDate,
+      notes: 'Auto-inferred: Collected from soil bin (estimated date)',
+      inferred: true
+    });
+    inferences.push({
+      action: 'sent_to_cintas',
+      barcode,
+      employeeId: null,
+      employeeName: null,
+      date: midDate,
+      notes: 'Auto-inferred: Sent to Cintas for cleaning (estimated date)',
+      inferred: true
+    });
+    return { valid: true, warnings: ['Item was with employee — auto-inferring full return → soil bin → Cintas cycle'], inferences, currentState: state };
+  }
+
+  // Case: Item is in warehouse, action is received_from_cintas
+  // Infer: sent to cintas first
+  if (state === 'warehouse' && newAction === 'received_from_cintas') {
+    const lastDate = lastTxn.date || newDate;
+    const midDate = estimateMidDate(lastDate, newDate);
+    inferences.push({
+      action: 'collected_from_soil_bin',
+      barcode,
+      employeeId: null,
+      employeeName: null,
+      date: midDate,
+      notes: 'Auto-inferred: Collected from soil bin (estimated date)',
+      inferred: true
+    });
+    inferences.push({
+      action: 'sent_to_cintas',
+      barcode,
+      employeeId: null,
+      employeeName: null,
+      date: midDate,
+      notes: 'Auto-inferred: Sent to Cintas for cleaning (estimated date)',
+      inferred: true
+    });
+    return { valid: true, warnings: ['Item was in warehouse — auto-inferring soil bin → Cintas cycle'], inferences, currentState: state };
+  }
+
+  // Case: Item is in soil_bin, action is received_from_cintas
+  // Infer: sent to cintas
+  if (state === 'soil_bin' && newAction === 'received_from_cintas') {
+    const lastDate = lastTxn.date || newDate;
+    const midDate = estimateMidDate(lastDate, newDate);
+    inferences.push({
+      action: 'sent_to_cintas',
+      barcode,
+      employeeId: null,
+      employeeName: null,
+      date: midDate,
+      notes: 'Auto-inferred: Sent to Cintas for cleaning (estimated date)',
+      inferred: true
+    });
+    return { valid: true, warnings: ['Item was in soil bin — auto-inferring Cintas send'], inferences, currentState: state };
+  }
+
+  // Case: Item is damaged, action is received_from_cintas
+  // Infer: sent to cintas (damaged return)
+  if (state === 'damaged' && newAction === 'received_from_cintas') {
+    const lastDate = lastTxn.date || newDate;
+    const midDate = estimateMidDate(lastDate, newDate);
+    inferences.push({
+      action: 'sent_to_cintas',
+      barcode,
+      employeeId: null,
+      employeeName: null,
+      date: midDate,
+      notes: 'Auto-inferred: Damaged item returned to Cintas (estimated date)',
+      inferred: true
+    });
+    return { valid: true, warnings: ['Damaged item — auto-inferring Cintas return'], inferences, currentState: state };
+  }
+
+  // Case: Item is at_cintas, action is distributed
+  // Infer: received from cintas
+  if (state === 'at_cintas' && newAction === 'distributed') {
+    inferences.push({
+      action: 'received_from_cintas',
+      barcode,
+      employeeId: null,
+      employeeName: null,
+      date: newDate,
+      notes: 'Auto-inferred: Received from Cintas before distribution',
+      inferred: true
+    });
+    return { valid: true, warnings: ['Item was at Cintas — auto-inferring receipt before distribution'], inferences, currentState: state };
+  }
+
+  // Case: Item is at_cintas, other actions
+  if (state === 'at_cintas' && newAction !== 'received_from_cintas') {
+    inferences.push({
+      action: 'received_from_cintas',
+      barcode,
+      employeeId: null,
+      employeeName: null,
+      date: newDate,
+      notes: 'Auto-inferred: Received from Cintas (estimated)',
+      inferred: true
+    });
+    // After receiving, check if we need more inferences
+    const nextState = 'warehouse';
+    const nextAllowed = VALID_TRANSITIONS[nextState];
+    if (nextAllowed.includes(newAction)) {
+      return { valid: true, warnings: ['Item was at Cintas — auto-inferring receipt'], inferences, currentState: state };
+    }
+  }
+
+  // Case: Item is with_employee, action is distributed (re-distribute)
+  if (state === 'with_employee' && newAction === 'distributed') {
+    inferences.push({
+      action: 'returned',
+      barcode,
+      employeeId: lastTxn.employeeId,
+      employeeName: lastTxn.employeeName,
+      date: newDate,
+      notes: 'Auto-inferred: Previous employee returned uniform before redistribution',
+      inferred: true
+    });
+    return { valid: true, warnings: ['Item was with another employee — auto-inferring return'], inferences, currentState: state };
+  }
+
+  // Fallback: allow with warning
+  warnings.push(`Unusual transition: ${state} → ${newAction}. Proceeding anyway.`);
+  return { valid: true, warnings, inferences: [], currentState: state };
+}
+
+// Estimate a midpoint date between two dates
+function estimateMidDate(dateA, dateB) {
+  const a = new Date(dateA);
+  const b = new Date(dateB);
+  if (isNaN(a.getTime()) || isNaN(b.getTime())) return today();
+  const mid = new Date((a.getTime() + b.getTime()) / 2);
+  return mid.toISOString().slice(0, 10);
+}
+
+// ============================================================
+// SUPABASE SYNC
+// ============================================================
+
+// Column mapping: v3 camelCase ↔ Supabase snake_case
+function empToSupabase(e) {
+  return {
+    id: e.id,
+    first_name: e.firstName || '',
+    last_name: e.lastName || '',
+    employee_id_number: e.employeeId || null,
+    production_centre: e.productionCentre || null,
+    department: e.department || null,
+    phone: e.phone || null,
+    notes: e.notes || null
+  };
+}
+
+function empFromSupabase(row) {
+  return {
+    id: row.id,
+    firstName: row.first_name || '',
+    lastName: row.last_name || '',
+    employeeId: row.employee_id_number || '',
+    productionCentre: row.production_centre || '',
+    department: row.department || '',
+    phone: row.phone || '',
+    notes: row.notes || '',
+    createdAt: row.created_at || new Date().toISOString()
+  };
+}
+
+function txnToSupabase(t) {
+  return {
+    id: t.id,
+    barcode: t.barcode,
+    action: t.action,
+    employee_id: t.employeeId || null,
+    uniform_type: t.uniformType || null,
+    notes: t.notes ? (t.inferred ? '[AUTO] ' + t.notes : t.notes) : (t.inferred ? '[AUTO]' : null),
+    date: t.date || today()
+  };
+}
+
+function txnFromSupabase(row, employeeMap) {
+  const emp = row.employee_id ? (employeeMap[row.employee_id] || null) : null;
+  const notes = row.notes || '';
+  const inferred = notes.startsWith('[AUTO]');
+  return {
+    id: row.id,
+    barcode: row.barcode,
+    action: row.action,
+    employeeId: row.employee_id || null,
+    employeeName: emp ? `${emp.firstName} ${emp.lastName}` : null,
+    uniformType: row.uniform_type || '',
+    notes: inferred ? notes.replace(/^\[AUTO\]\s*/, '') : notes,
+    date: row.date || today(),
+    createdAt: row.created_at || new Date().toISOString(),
+    inferred
+  };
+}
+
+// The Supabase client instance (created after credentials are saved)
+let _supabaseClient = null;
+let _realtimeChannel = null;
+
+function getSupabase() {
+  if (_supabaseClient) return _supabaseClient;
+  const url = localStorage.getItem('ut_cloud_url') || '';
+  const key = localStorage.getItem('ut_cloud_key') || '';
+  if (!url || !key) return null;
+  try {
+    _supabaseClient = window.supabase.createClient(url, key);
+    return _supabaseClient;
+  } catch (e) {
+    console.error('Failed to create Supabase client:', e);
+    return null;
+  }
+}
+
 const CloudSync = {
   get apiUrl() { return localStorage.getItem('ut_cloud_url') || ''; },
   get apiKey() { return localStorage.getItem('ut_cloud_key') || ''; },
-
-  isReady() { return !!(this.apiUrl && this.apiKey); },
+  isReady() { return !!(this.apiUrl && this.apiKey && _supabaseClient); },
 
   configure(url, key) {
     localStorage.setItem('ut_cloud_url', url.trim());
     localStorage.setItem('ut_cloud_key', key.trim());
+    // Reset client so it's recreated with new credentials
+    _supabaseClient = null;
+    if (_realtimeChannel) { try { _realtimeChannel.unsubscribe(); } catch(e){} _realtimeChannel = null; }
+    getSupabase();
   },
 
-  // Apps Script POST requires Content-Type text/plain (not application/json)
-  async post(action, payload) {
-    const resp = await fetch(this.apiUrl, {
-      method: 'POST',
-      redirect: 'follow',
-      body: JSON.stringify({ key: this.apiKey, action, payload }),
-      headers: { 'Content-Type': 'text/plain' }
-    });
-    return this._parseResp(resp);
-  },
-
-  async get(action) {
-    const url = `${this.apiUrl}?key=${encodeURIComponent(this.apiKey)}&action=${encodeURIComponent(action)}`;
-    const resp = await fetch(url, { redirect: 'follow' });
-    return this._parseResp(resp);
-  },
-
-  // Parse Apps Script response safely — HTML (login redirects, errors) returns a useful message
-  async _parseResp(resp) {
-    const text = await resp.text();
-    try {
-      return JSON.parse(text);
-    } catch (_) {
-      // HTML means Apps Script redirected to login or the script threw an unhandled error
-      if (text.includes('<!DOCTYPE') || text.includes('<html')) {
-        if (text.includes('signin') || text.includes('accounts.google')) {
-          throw new Error('Apps Script requires authorization. Open the Web App URL directly in your browser and sign in, then retry.');
-        }
-        throw new Error('Apps Script returned an HTML page instead of JSON. Make sure you deployed as "Anyone" (not "Anyone with Google Account") and created a New Version deployment.');
-      }
-      throw new Error('Invalid response from Apps Script: ' + text.slice(0, 120));
-    }
-  },
-
+  // ── Transactions ──────────────────────────────────────────
   async pushTransaction(txn) {
-    if (!this.isReady()) return;
-    try { await this.post('addTransaction', txn); } catch (_) {}
+    const sb = getSupabase();
+    if (!sb) return;
+    try {
+      const row = txnToSupabase(txn);
+      const { error } = await sb.from('transactions').upsert(row, { onConflict: 'id' });
+      if (error) console.warn('Supabase pushTransaction error:', error.message);
+    } catch (e) { console.warn('pushTransaction failed:', e.message); }
   },
 
+  async pushTransactionsBulk(txns) {
+    const sb = getSupabase();
+    if (!sb || !txns.length) return;
+    try {
+      const rows = txns.map(txnToSupabase);
+      // Upsert in batches of 500 to avoid payload limits
+      for (let i = 0; i < rows.length; i += 500) {
+        const { error } = await sb.from('transactions').upsert(rows.slice(i, i + 500), { onConflict: 'id' });
+        if (error) throw new Error(error.message);
+      }
+    } catch (e) { throw new Error('Bulk transaction push failed: ' + e.message); }
+  },
+
+  async deleteTransaction(id) {
+    const sb = getSupabase();
+    if (!sb) return;
+    try {
+      const { error } = await sb.from('transactions').delete().eq('id', id);
+      if (error) console.warn('Supabase deleteTransaction error:', error.message);
+    } catch (e) { console.warn('deleteTransaction failed:', e.message); }
+  },
+
+  // ── Employees ─────────────────────────────────────────────
   async pushEmployee(emp) {
-    if (!this.isReady()) return;
-    try { await this.post('saveEmployee', emp); } catch (_) {}
+    const sb = getSupabase();
+    if (!sb) return;
+    try {
+      const row = empToSupabase(emp);
+      const { error } = await sb.from('employees').upsert(row, { onConflict: 'id' });
+      if (error) console.warn('Supabase pushEmployee error:', error.message);
+    } catch (e) { console.warn('pushEmployee failed:', e.message); }
   },
 
   async removeEmployee(id) {
-    if (!this.isReady()) return;
-    try { await this.post('deleteEmployee', { id }); } catch (_) {}
-  },
-
-  async syncAll() {
-    if (!this.isReady()) { showToast('Cloud sync not configured. Go to Settings → Cloud Sync.', 'error'); return; }
-    const btn = document.getElementById('cloud-sync-btn');
-    if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+    const sb = getSupabase();
+    if (!sb) return;
     try {
-      const result = await this.post('syncAll', {
-        employees:    DB.employees,
-        transactions: DB.transactions,
-        centres:      DB.centres,
-        uniformTypes: DB.uniformTypes
-      });
-      if (result && result.done) {
-        localStorage.setItem('ut_last_sync', new Date().toISOString());
-        showToast('✓ All data pushed to Google Sheets!', 'success');
-      } else {
-        showToast('Sync failed: ' + (result?.error || 'Unknown error'), 'error');
-      }
-    } catch (e) {
-      showToast('Sync error: ' + e.message, 'error');
-    } finally {
-      if (btn) { btn.disabled = false; btn.textContent = 'Push All to Cloud'; }
-      updateSyncStatus();
-    }
+      const { error } = await sb.from('employees').delete().eq('id', id);
+      if (error) console.warn('Supabase removeEmployee error:', error.message);
+    } catch (e) { console.warn('removeEmployee failed:', e.message); }
   },
 
+  // ── Config ────────────────────────────────────────────────
+  async pushConfig() {
+    const sb = getSupabase();
+    if (!sb) return;
+    try {
+      await sb.from('config').upsert(
+        [{ key: 'production_centres', value: DB.centres },
+         { key: 'uniform_types',      value: DB.uniformTypes }],
+        { onConflict: 'key' }
+      );
+    } catch (e) { console.warn('pushConfig failed:', e.message); }
+  },
+
+  // ── Pull All (full sync from Supabase) ────────────────────
   async pullAll(silent = false) {
-    if (!this.isReady()) { 
-      if (!silent) showToast('Cloud sync not configured. Go to Settings → Cloud Sync.', 'error'); 
-      return; 
+    const sb = getSupabase();
+    if (!sb) {
+      if (!silent) showToast('Supabase not configured. Go to Settings → Database.', 'error');
+      return;
     }
-    const btn = document.getElementById('cloud-pull-btn');
-    const syncNowBtn = document.getElementById('cloud-sync-now-btn');
-    if (btn) { btn.disabled = true; btn.textContent = 'Pulling…'; }
-    if (syncNowBtn) { syncNowBtn.disabled = true; syncNowBtn.textContent = 'Syncing…'; }
-    
-    try {
-      const data = await this.get('getAll');
-      if (!data || data.error) { 
-        if (!silent) showToast('Pull failed: ' + (data?.error || 'No data'), 'error'); 
-        return; 
-      }
-      
-      // Debug: Log employee and transaction data from Google Sheets
-      console.log('Google Sheets employee data (first 3):', (data.employees || []).slice(0, 3));
-      console.log('Employee count from Google Sheets:', (data.employees || []).length);
-      console.log('Google Sheets transactions (first 3):', (data.transactions || []).slice(0, 3));
-      console.log('Transaction count from Google Sheets:', (data.transactions || []).length);
-      
-      // Track changes for notification
-      let hasChanges = false;
-      const oldEmployeeCount = DB.employees.length;
-      const oldTransactionCount = DB.transactions.length;
-      
-      // Normalize data types from Google Sheets (numbers to strings, etc.)
-      if (data.employees) {
-        data.employees = data.employees.map(e => {
-          // Handle both mapped field names and raw Google Sheets "Column X" format
-          let firstName = String(e.firstName || e['Column 2'] || '').trim();
-          let lastName = String(e.lastName || e['Column 3'] || '').trim();
-          const name = String(e.name || '').trim();
-          const id = String(e.id || e['Column 1'] || uid()).trim();
-          
-          // If we have a name field but no firstName/lastName, split it
-          if (name && (!firstName || !lastName)) {
-            const parts = name.split(' ');
-            if (parts.length >= 2) {
-              firstName = parts[0];
-              lastName = parts.slice(1).join(' ');
-            } else if (parts.length === 1) {
-              firstName = parts[0];
-              lastName = '';
-            }
-          }
-          
-          return {
-            id,
-            firstName,
-            lastName,
-            employeeId: String(e.employeeId || e['Column 4'] || '').trim(),
-            productionCentre: String(e.productionCentre || e['Column 5'] || '').trim(),
-            department: String(e.department || e['Column 6'] || '').trim(),
-            phone: String(e.phone || e['Column 7'] || '').trim(),
-            notes: String(e.notes || e['Column 8'] || '').trim(),
-            createdAt: e.createdAt || e['Column 9'] || new Date().toISOString()
-          };
-        });
-        DB.saveEmployees(data.employees);
-        if (data.employees.length !== oldEmployeeCount) hasChanges = true;
-      }
-      
-      if (data.transactions) {
-        console.log('Raw transaction data from Google Sheets:', data.transactions.slice(0, 3));
-        data.transactions = data.transactions.map((t, idx) => {
-          const raw = t || {};
-          
-          // Handle both mapped field names and raw Google Sheets "Column X" format
-          const id = String(raw.id || raw['Column 1'] || raw.transactionId || raw.txnId || uid()).trim();
-          const barcode = String(raw.barcode || raw.Barcode || raw['Column 2'] || '').trim();
-          const action = normalizeRemoteAction(raw.action || raw.Action || raw.actionLabel || raw.ActionLabel || raw['Column 3'] || '');
-          const date = normalizeDate(raw.date || raw.Date || raw['Column 8'] || raw['Column 7'] || '');
-          const createdAt = raw.createdAt || raw.created_at || raw['Column 9'] || new Date().toISOString();
-          
-          const normalized = {
-            id: id || uid(),
-            action,
-            barcode,
-            employeeId: String(raw.employeeId || raw.employeeID || raw['Employee ID'] || raw.employee_id || raw['Column 4'] || '').trim(),
-            employeeName: String(raw.employeeName || raw['Employee Name'] || raw.name || raw.Name || raw['Column 5'] || '').trim(),
-            uniformType: String(raw.uniformType || raw['Uniform Type'] || raw['Column 6'] || '').trim(),
-            notes: String(raw.notes || raw.Notes || raw['Column 10'] || '').trim(),
-            date,
-            createdAt
-          };
-          
-          if (idx < 3) {
-            console.log(`Normalized transaction ${idx}:`, normalized);
-            console.log(`  Raw cols: Col1="${raw['Column 1']}" Col2="${raw['Column 2']}" Col3="${raw['Column 3']}"`)
-            console.log(`  => id="${normalized.id}" barcode="${normalized.barcode}" action="${normalized.action}"`);
-          }
-          return normalized;
-        });
-        console.log('Total normalized transactions:', data.transactions.length);
-      }
-      
-      // Update config data
-      if (data.centres && data.centres.length) DB.saveCentres(data.centres);
-      if (data.uniformTypes && data.uniformTypes.length) DB.saveTypes(data.uniformTypes);
-      
-      // Update transactions more carefully
-      if (data.transactions) {
-        // Create a map of existing transactions by ID for quick lookup
-        const existingTxns = new Map();
-        DB_MEMORY.transactions.forEach(t => existingTxns.set(t.id, t));
-        
-        // Also create a map for deduplication by barcode+date+action+employee
-        const dedupeKey = (t) => `${t.barcode}|${t.date}|${t.action}|${t.employeeId || ''}`;
-        const dedupeMap = new Map();
-        DB_MEMORY.transactions.forEach(t => dedupeMap.set(dedupeKey(t), t.id));
-        
-        // Merge transactions: keep local ones that aren't in cloud, update existing ones
-        const mergedTxns = [...DB_MEMORY.transactions]; // Start with local
-        
-        for (const cloudTxn of data.transactions) {
-          // Check for duplicate by ID first
-          const existingIdx = mergedTxns.findIndex(t => t.id === cloudTxn.id);
-          if (existingIdx >= 0) {
-            // Check if data actually changed
-            const existing = mergedTxns[existingIdx];
-            if (JSON.stringify(existing) !== JSON.stringify(cloudTxn)) {
-              mergedTxns[existingIdx] = cloudTxn;
-              hasChanges = true;
-            }
-          } else {
-            // Check for duplicate by content (barcode+date+action+employee)
-            const dedupKey = dedupeKey(cloudTxn);
-            if (dedupeMap.has(dedupKey)) {
-              // This transaction already exists (possibly with different ID)
-              console.log('Duplicate transaction detected (by content):', dedupKey);
-              continue; // Skip adding it
-            }
-            
-            // Add new transaction from cloud
-            mergedTxns.push(cloudTxn);
-            dedupeMap.set(dedupKey, cloudTxn.id);
-            hasChanges = true;
-          }
-        }
-        
-        // Save merged transactions
-        DB_MEMORY.transactions = mergedTxns.sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
 
-        // Update IndexedDB
-        await IDB.clearTransactions();
-        for (const t of DB_MEMORY.transactions) {
-          try {
-            await IDB.saveTransaction(t);
-          } catch (err) {
-            console.error('Failed saving transaction to IndexedDB:', err, 'Transaction object:', t);
-            // Continue saving others — we'll still report a pull error after loop
-          }
-        }
-        
-        if (data.transactions.length !== oldTransactionCount) hasChanges = true;
+    const syncNowBtn = document.getElementById('cloud-sync-now-btn');
+    if (syncNowBtn) { syncNowBtn.disabled = true; syncNowBtn.textContent = 'Pulling…'; }
+
+    // Helper: yield to browser between heavy steps
+    const yield_ = () => new Promise(r => setTimeout(r, 0));
+
+    try {
+      // ── Step 1: Fetch employees ──────────────────────────────
+      if (!silent) showToast('⏳ Fetching employees…', 'info');
+      await yield_();
+
+      const { data: empRows, error: empErr } = await sb.from('employees').select('*').order('created_at');
+      if (empErr) throw new Error('Employees fetch failed: ' + empErr.message);
+
+      const employees = (empRows || []).map(empFromSupabase);
+      const employeeMap = {};
+      employees.forEach(e => { employeeMap[e.id] = e; });
+
+      // ── Step 2: Fetch transactions (paginated) ───────────────
+      if (!silent) showToast(`⏳ Fetching transactions (${employees.length} employees loaded)…`, 'info');
+      await yield_();
+
+      let allTxnRows = [];
+      let from = 0;
+      const pageSize = 1000;
+      while (true) {
+        const { data: rows, error: txnErr } = await sb
+          .from('transactions').select('*')
+          .order('created_at', { ascending: false })
+          .range(from, from + pageSize - 1);
+        if (txnErr) throw new Error('Transactions fetch failed: ' + txnErr.message);
+        if (!rows || rows.length === 0) break;
+        allTxnRows = allTxnRows.concat(rows);
+        if (!silent) showToast(`⏳ Fetched ${allTxnRows.length} transactions…`, 'info');
+        await yield_();
+        if (rows.length < pageSize) break;
+        from += pageSize;
       }
-      
+
+      // ── Step 3: Map rows (chunked with yields) ───────────────
+      if (!silent) showToast(`⏳ Processing ${allTxnRows.length} transactions…`, 'info');
+      await yield_();
+
+      const transactions = [];
+      const MAP_CHUNK = 500;
+      for (let i = 0; i < allTxnRows.length; i += MAP_CHUNK) {
+        const chunk = allTxnRows.slice(i, i + MAP_CHUNK);
+        transactions.push(...chunk.map(r => txnFromSupabase(r, employeeMap)));
+        await yield_(); // yield every 500 rows
+      }
+
+      // ── Step 4: Fetch config ─────────────────────────────────
+      const { data: cfgRows } = await sb.from('config').select('*');
+      const centres      = cfgRows?.find(r => r.key === 'production_centres')?.value || DB.centres;
+      const uniformTypes = cfgRows?.find(r => r.key === 'uniform_types')?.value    || DB.uniformTypes;
+
+      // ── Step 5: Detect changes ───────────────────────────────
+      const hasNewEmployees = employees.length    !== DB.employees.length;
+      const hasNewTxns      = transactions.length !== DB.transactions.length;
+
+      // ── Step 6: Update memory ────────────────────────────────
+      DB.saveEmployees(employees);
+      DB.saveCentres(centres);
+      DB.saveTypes(uniformTypes);
+      DB_MEMORY.transactions = transactions;
+      await yield_();
+
+      // ── Step 7: Save to IndexedDB (chunked internally) ───────
+      if (!silent) showToast(`⏳ Saving to local storage…`, 'info');
+      try { await IDB.saveTransactionsBulk(transactions); } catch (e) {
+        console.error('Failed saving transactions to IndexedDB:', e);
+      }
+
       localStorage.setItem('ut_last_sync', new Date().toISOString());
-      
-      // Show appropriate message
+
+      // ── Step 8: Re-render ────────────────────────────────────
       if (!silent) {
-        showToast('✓ Data synced from Google Sheets!', 'success');
-      } else if (hasChanges && silent) {
-        // Show subtle notification for automatic sync with changes
-        showToast('🔄 Data updated from other devices', 'info');
+        showToast(`✓ Synced — ${employees.length} employees, ${transactions.length} transactions`, 'success');
+      } else if (hasNewEmployees || hasNewTxns) {
+        showToast('🔄 Data updated from Supabase', 'info');
       }
-      
-      renderDashboard(); renderEmployeeList(); renderSettings();
+
+      await yield_();
+      renderDashboard();
+      await yield_();
+      renderEmployeeList();
+      renderSettings();
+
     } catch (e) {
       if (!silent) showToast('Pull error: ' + e.message, 'error');
+      else console.warn('Silent pull error:', e.message);
     } finally {
-      if (btn) { btn.disabled = false; btn.textContent = 'Pull from Cloud'; }
-      if (syncNowBtn) { syncNowBtn.disabled = false; syncNowBtn.textContent = 'Sync Now'; }
+      if (syncNowBtn) { syncNowBtn.disabled = false; syncNowBtn.textContent = 'Pull from Supabase'; }
       updateSyncStatus();
     }
   },
 
+  // ── Push All (full local data → Supabase) ─────────────────
+  async syncAll() {
+    const sb = getSupabase();
+    if (!sb) { showToast('Supabase not configured. Go to Settings → Database.', 'error'); return; }
+
+    const btn = document.getElementById('cloud-sync-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Pushing…'; }
+
+    try {
+      // Push employees
+      const empRows = DB.employees.map(empToSupabase);
+      if (empRows.length) {
+        for (let i = 0; i < empRows.length; i += 500) {
+          const { error } = await sb.from('employees').upsert(empRows.slice(i, i + 500), { onConflict: 'id' });
+          if (error) throw new Error('Employee push failed: ' + error.message);
+        }
+      }
+
+      // Push transactions
+      await this.pushTransactionsBulk(DB.transactions);
+
+      // Push config
+      await this.pushConfig();
+
+      localStorage.setItem('ut_last_sync', new Date().toISOString());
+      showToast(`✓ Pushed ${DB.employees.length} employees & ${DB.transactions.length} transactions to Supabase!`, 'success');
+
+    } catch (e) {
+      showToast('Push error: ' + e.message, 'error');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Push All to Supabase'; }
+      updateSyncStatus();
+    }
+  },
+
+  // ── Test Connection ────────────────────────────────────────
   async testConnection() {
-    if (!this.isReady()) { showToast('Enter the Web App URL and API Key first.', 'error'); return; }
+    const url = this.apiUrl;
+    const key = this.apiKey;
+    if (!url || !key) { showToast('Enter Supabase URL and Anon Key first.', 'error'); return; }
+    if (!url.includes('supabase.co') && !url.includes('supabase.io') && !url.includes('localhost')) {
+      showToast('URL should be your Supabase project URL (*.supabase.co)', 'error'); return;
+    }
+
     const btn = document.getElementById('cloud-test-btn');
     if (btn) { btn.disabled = true; btn.textContent = 'Testing…'; }
+
     try {
-      const data = await this.get('getAll');
-      if (data && data.error) {
-        showToast('Connection failed: ' + data.error, 'error');
-      } else {
-        const empCount = (data.employees || []).length;
-        const txnCount = (data.transactions || []).length;
-        showToast(`✓ Connected! Cloud has ${empCount} employees & ${txnCount} transactions.`, 'success');
-        localStorage.setItem('ut_last_sync', new Date().toISOString());
+      // Recreate client with current input values (may not have been saved yet)
+      const testClient = window.supabase.createClient(url, key, { auth: { persistSession: false } });
+      const { data, error } = await testClient.from('employees').select('id', { count: 'exact', head: true });
+      if (error) {
+        if (error.code === 'PGRST301' || error.message.includes('JWT')) {
+          showToast('Invalid Anon Key. Check your Supabase API settings.', 'error');
+        } else if (error.message.includes('relation') || error.code === '42P01') {
+          showToast('Connected! But tables not found — run supabase_schema.sql first.', 'error');
+        } else {
+          showToast('Connection error: ' + error.message, 'error');
+        }
+        return;
       }
+
+      // Count transactions too
+      const { count: txnCount } = await testClient
+        .from('transactions').select('id', { count: 'exact', head: true });
+
+      const { count: empCount } = await testClient
+        .from('employees').select('id', { count: 'exact', head: true });
+
+      showToast(`✓ Connected! ${empCount || 0} employees, ${txnCount || 0} transactions in Supabase.`, 'success');
+      localStorage.setItem('ut_last_sync', new Date().toISOString());
+      updateSyncStatus();
+
     } catch (e) {
-      showToast('Connection error: ' + e.message, 'error');
+      showToast('Connection failed: ' + e.message, 'error');
     } finally {
       if (btn) { btn.disabled = false; btn.textContent = 'Test Connection'; }
-      updateSyncStatus();
     }
   }
 };
@@ -414,91 +758,113 @@ function updateSyncStatus() {
   const statusEl = document.getElementById('cloud-status-text');
   const dotEl    = document.getElementById('cloud-status-dot');
   const ts       = localStorage.getItem('ut_last_sync');
-  const isAutoSync = autoSyncInterval && CloudSync.isReady();
-  
+  const ready    = CloudSync.isReady();
   if (statusEl) {
     let statusText = '';
-    if (ts) {
-      const lastSync = new Date(ts);
-      const now = new Date();
-      const minutesAgo = Math.floor((now - lastSync) / (1000 * 60));
-      
-      if (minutesAgo < 1) {
-        statusText = 'Last sync: Just now';
-      } else if (minutesAgo < 60) {
-        statusText = `Last sync: ${minutesAgo}m ago`;
-      } else {
-        const hoursAgo = Math.floor(minutesAgo / 60);
-        statusText = `Last sync: ${hoursAgo}h ago`;
-      }
+    if (!ready) {
+      statusText = 'Not connected';
+    } else if (ts) {
+      const minutesAgo = Math.floor((Date.now() - new Date(ts).getTime()) / 60000);
+      if (minutesAgo < 1)   statusText = 'Last sync: Just now';
+      else if (minutesAgo < 60) statusText = `Last sync: ${minutesAgo}m ago`;
+      else                  statusText = `Last sync: ${Math.floor(minutesAgo / 60)}h ago`;
     } else {
-      statusText = 'Never synced';
+      statusText = 'Connected (never synced)';
     }
-    
-    if (isAutoSync) {
-      statusText += ' (Auto-sync active)';
-    }
-    
+    if (autoSyncInterval && ready) statusText += ' · Live';
     statusEl.textContent = statusText;
   }
-  if (dotEl) { 
-    dotEl.className = 'cloud-dot ' + (CloudSync.isReady() ? 'ready' : 'off');
-  }
+  if (dotEl) dotEl.className = 'cloud-dot ' + (ready ? 'ready' : 'off');
 }
 
 function saveCloudConfig() {
   const url = (document.getElementById('cloud-url')?.value || '').trim();
   const key = (document.getElementById('cloud-key')?.value || '').trim();
-  if (!url || !key) { showToast('Please enter both the Web App URL and API Key.', 'error'); return; }
-  if (!url.includes('script.google.com/macros/s/')) {
-    showToast('URL looks wrong — it should contain script.google.com/macros/s/', 'error'); return;
+  if (!url || !key) { showToast('Please enter both Supabase URL and Anon Key.', 'error'); return; }
+  if (!url.startsWith('https://') && !url.startsWith('http://')) {
+    showToast('URL must start with https://', 'error'); return;
   }
   CloudSync.configure(url, key);
-  showToast('Cloud configuration saved! Click Test Connection to verify.', 'success');
+  showToast('Supabase configuration saved! Testing connection…', 'success');
   updateSyncStatus();
-  startAutoSync(); // Start automatic syncing if newly configured
+  startAutoSync();
+  // Auto-pull after saving
+  setTimeout(() => CloudSync.pullAll(false), 500);
 }
+
 window.saveCloudConfig = saveCloudConfig;
 window.cloudSyncAll    = () => CloudSync.syncAll();
-window.cloudPullAll    = () => CloudSync.pullAll(false); // Manual pull, show toasts
-window.cloudSyncNow    = () => CloudSync.pullAll(false); // Immediate sync with feedback
+window.cloudPullAll    = () => CloudSync.pullAll(false);
+window.cloudSyncNow    = () => CloudSync.pullAll(false);
 window.cloudTestConn   = () => CloudSync.testConnection();
 
-// Automatic sync every 2 minutes
-let autoSyncInterval;
-function startAutoSync() {
-  // Clear any existing interval
-  if (autoSyncInterval) clearInterval(autoSyncInterval);
-  
-  // Only start if cloud sync is configured
-  if (!CloudSync.isReady()) return;
-  
-  // Sync every 30 seconds (30,000 ms) - more frequent for better cross-device sync
-  autoSyncInterval = setInterval(async () => {
-    try {
-      // Always sync, even in background tabs (removed document.hidden check)
-      console.log('Auto-syncing with Google Sheets...');
-      await CloudSync.pullAll(true); // Silent auto-sync
-      console.log('Auto-sync completed successfully');
-    } catch (e) {
-      console.warn('Auto-sync failed:', e.message);
-      // Don't show error toast for automatic syncs to avoid spam
-    }
-  }, 30 * 1000); // 30 seconds
-  
-  console.log('Automatic cloud sync started (every 30 seconds)');
-  updateSyncStatus(); // Update status to show auto-sync is active
-}
-
-// Stop auto sync when logging out
-function stopAutoSync() {
-  if (autoSyncInterval) {
-    clearInterval(autoSyncInterval);
-    autoSyncInterval = null;
-    console.log('Automatic cloud sync stopped');
-    updateSyncStatus(); // Update status to remove auto-sync indicator
+// Realtime subscription — get notified when other devices push new scans
+function startRealtimeSubscription() {
+  const sb = getSupabase();
+  if (!sb || _realtimeChannel) return;
+  try {
+    _realtimeChannel = sb
+      .channel('unitrack-realtime')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'transactions' }, async (payload) => {
+        const newRow = payload.new;
+        if (!newRow) return;
+        // Build employee map for name lookup
+        const employeeMap = {};
+        DB.employees.forEach(e => { employeeMap[e.id] = e; });
+        const txn = txnFromSupabase(newRow, employeeMap);
+        // Only add if not already known locally
+        if (!DB_MEMORY.transactions.find(t => t.id === txn.id)) {
+          DB_MEMORY.transactions.unshift(txn);
+          IDB.saveTransaction(txn).catch(() => {});
+          if (currentPage === 'dashboard') renderDashboard();
+          if (currentPage === 'reports')   renderReport();
+        }
+      })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'employees' }, async (payload) => {
+        const newRow = payload.new;
+        if (!newRow) return;
+        const emp = empFromSupabase(newRow);
+        if (!DB.employees.find(e => e.id === emp.id)) {
+          const list = DB.employees;
+          list.push(emp);
+          DB.saveEmployees(list);
+          if (currentPage === 'employees') renderEmployeeList();
+        }
+      })
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('UniTrack: Supabase realtime connected');
+          updateSyncStatus();
+        }
+      });
+  } catch (e) {
+    console.warn('Realtime subscription failed:', e.message);
   }
 }
+
+// Auto-sync every 2 minutes + realtime subscription
+let autoSyncInterval;
+function startAutoSync() {
+  if (autoSyncInterval) clearInterval(autoSyncInterval);
+  const sb = getSupabase();
+  if (!sb) return;
+
+  // Start realtime for instant multi-device updates
+  startRealtimeSubscription();
+
+  autoSyncInterval = setInterval(async () => {
+    try { await CloudSync.pullAll(true); } catch (e) { console.warn('Auto-sync failed:', e.message); }
+  }, 120 * 1000); // 2 minutes fallback
+
+  updateSyncStatus();
+}
+
+function stopAutoSync() {
+  if (autoSyncInterval) { clearInterval(autoSyncInterval); autoSyncInterval = null; }
+  if (_realtimeChannel) { try { _realtimeChannel.unsubscribe(); } catch(e){} _realtimeChannel = null; }
+  updateSyncStatus();
+}
+
 
 // ============================================================
 // UTILITIES
@@ -507,17 +873,19 @@ function uid()  { return Date.now().toString(36) + Math.random().toString(36).sl
 function today(){ return new Date().toISOString().slice(0,10); }
 function normalizeDate(d) {
   if (!d) return today();
-  // If already in YYYY-MM-DD format, return as-is
   if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
-  // If in MM/DD/YYYY format, convert to YYYY-MM-DD
   if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(d)) {
     const [m, day, y] = d.split('/');
     return `${y}-${String(m).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
   }
-  // Otherwise assume ISO and extract the date portion
   return d.split('T')[0] || today();
 }
-function formatDate(d) { if (!d) return ''; const date = normalizeDate(d); const [y,m,day] = date.split('-'); return `${m}/${day}/${y}`; }
+function formatDate(d) {
+  if (!d) return '';
+  const date = normalizeDate(d);
+  const [y,m,day] = date.split('-');
+  return `${m}/${day}/${y}`;
+}
 function formatDateTime(iso) {
   if (!iso) return '';
   const d = new Date(iso);
@@ -540,6 +908,17 @@ function actionLabel(a) {
     received_from_cintas: '← Cintas',
     reported_issue:       'Issue/Damaged'
   }[a] || a;
+}
+
+function stateLabel(s) {
+  return {
+    warehouse:     'In Warehouse',
+    with_employee: 'With Employee',
+    soil_bin:      'In Soil Bin',
+    at_cintas:     'At Cintas',
+    damaged:       'Damaged',
+    unknown:       'Unknown'
+  }[s] || s;
 }
 
 function normalizeRemoteAction(action) {
@@ -574,6 +953,56 @@ function escHtml(s) {
 }
 
 // ============================================================
+// iOS BLUETOOTH KEYBOARD FIX
+// ============================================================
+// When a Bluetooth barcode scanner is connected, iOS treats it
+// as a hardware keyboard and suppresses the software keyboard.
+// forceKeyboard() uses the readOnly toggle trick — the only
+// cross-iOS-version reliable way to force the keyboard open.
+// ============================================================
+function forceKeyboard(inputId) {
+  const el = typeof inputId === 'string'
+    ? document.getElementById(inputId)
+    : inputId;
+  if (!el) return;
+
+  // Trick: briefly set readOnly → focus → remove readOnly → focus again
+  // This forces iOS to re-evaluate and show the software keyboard
+  el.setAttribute('readonly', 'readonly');
+  el.focus();
+  requestAnimationFrame(() => {
+    el.removeAttribute('readonly');
+    el.focus();
+    // Place cursor at end
+    const len = el.value.length;
+    try { el.setSelectionRange(len, len); } catch(_) {}
+  });
+}
+window.forceKeyboard = forceKeyboard;
+
+// On touch devices: auto-force keyboard on touchend for text inputs
+// so users don't always have to tap the ⌨ button
+(function initIOSKeyboardFix() {
+  const isTouch = navigator.maxTouchPoints > 0 || 'ontouchstart' in window;
+  if (!isTouch) return;
+
+  document.addEventListener('touchend', (e) => {
+    const target = e.target;
+    if (!target) return;
+    const tag  = target.tagName;
+    const type = (target.type || '').toLowerCase();
+    const im   = (target.getAttribute('inputmode') || '').toLowerCase();
+
+    // Apply to text inputs but NOT the barcode input (inputmode=none)
+    if ((tag === 'INPUT' || tag === 'TEXTAREA') && im !== 'none' && type !== 'date') {
+      // Small delay so the tap registers first
+      setTimeout(() => forceKeyboard(target), 80);
+    }
+  }, { passive: true });
+})();
+
+
+// ============================================================
 // UI STATE
 // ============================================================
 let currentUser   = null;
@@ -583,7 +1012,7 @@ let currentReport = 'missing';
 let selectedEmployee  = null;
 let sessionScans  = 0;
 let sidebarOpen   = true;
-let focusLockInterval = null;  // keeps barcode input focused on scan page
+let focusLockInterval = null;
 
 // Excel import state
 let xlRawRows = [];
@@ -598,26 +1027,23 @@ document.addEventListener('DOMContentLoaded', async () => {
   const now = new Date();
   document.getElementById('dateDisplay').textContent =
     now.toLocaleDateString('en-US',{weekday:'short',month:'long',day:'numeric',year:'numeric'});
-  
+
   try {
     await IDB.init();
-    
+
     // Migration logic
     const lsEmployees = localStorage.getItem('ut_employees');
     const lsTransactions = localStorage.getItem('ut_transactions');
     const lsCentres = localStorage.getItem('ut_centres');
     const lsTypes = localStorage.getItem('ut_types');
-    
     let hasMigratedAny = false;
-    
+
     // Employees
     let empData = await IDB.get('ut_employees');
     if (!empData && lsEmployees) { empData = JSON.parse(lsEmployees); hasMigratedAny = true; }
     if (empData) {
-      // Repair malformed employee data (from old Google Sheets pulls with Column X format)
       empData = empData.map(e => {
         if (!e.firstName && e['Column 2']) {
-          // Data has raw Column X format, needs repair
           return {
             id: String(e.id || e['Column 1'] || uid()).trim(),
             firstName: String(e['Column 2'] || '').trim(),
@@ -630,27 +1056,17 @@ document.addEventListener('DOMContentLoaded', async () => {
             createdAt: e['Column 9'] || e.createdAt || new Date().toISOString()
           };
         }
-        return e; // Already properly formatted
+        return e;
       });
       DB_MEMORY.employees = empData;
-      // Re-save the repaired data
       await IDB.set('ut_employees', empData);
-      hasMigratedAny = true;
-      console.log('Repaired employees from IndexedDB:', DB_MEMORY.employees.length, 'records');
-      if (DB_MEMORY.employees.length > 0) {
-        console.log('First employee after repair:', DB_MEMORY.employees[0]);
-      }
     }
-    
-    // Transactions (Optimized Record-Based Storage)
+
+    // Transactions
     let txData = await IDB.getAllTransactions();
-    console.log('Loaded transactions from IndexedDB (record store):', txData.length, 'records');
-    
-    // Repair malformed transaction data (from old Google Sheets pulls with Column X format)
-    txData = txData.map((t, idx) => {
+    txData = txData.map(t => {
       if (!t.barcode && t['Column 2']) {
-        // Data has raw Column X format, needs repair
-        const repaired = {
+        return {
           id: String(t.id || t['Column 1'] || uid()).trim(),
           action: normalizeRemoteAction(t['Column 3'] || ''),
           barcode: String(t['Column 2'] || '').trim(),
@@ -659,34 +1075,19 @@ document.addEventListener('DOMContentLoaded', async () => {
           uniformType: String(t['Column 6'] || '').trim(),
           notes: String(t['Column 10'] || '').trim(),
           date: normalizeDate(t['Column 8'] || t['Column 7'] || ''),
-          createdAt: t['Column 9'] || t.createdAt || new Date().toISOString()
+          createdAt: t['Column 9'] || t.createdAt || new Date().toISOString(),
+          inferred: t.inferred || false
         };
-        if (idx < 3) {
-          console.log(`Repaired transaction ${idx}:`, repaired);
-        }
-        return repaired;
       }
-      return t; // Already properly formatted
+      return t;
     });
-    
-    if (txData.length > 0) {
-      console.log('First 3 transactions after repair:', txData.slice(0, 3).map(t => ({
-        id: t.id,
-        action: t.action,
-        barcode: t.barcode,
-        createdAt: t.createdAt
-      })));
-    }
-    // Migration from old array-based store if detected
+
+    // Migration from legacy store
     const legacyTxData = await IDB.get('ut_transactions');
     if (legacyTxData && legacyTxData.length > 0) {
-      console.log('Migrating legacy transactions to record-based store...');
-      // Legacy data is already in the record-based store, skip this
-      IDB.set('ut_transactions', []); // Clear legacy marker
+      IDB.set('ut_transactions', []);
       hasMigratedAny = true;
     }
-    
-    // Final check for localStorage migration
     if (txData.length === 0 && lsTransactions) {
       const parsed = JSON.parse(lsTransactions);
       for (const t of parsed) {
@@ -696,48 +1097,19 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       hasMigratedAny = true;
     }
-    
-    // Sort transactions by date (newest first)
+
     DB_MEMORY.transactions = txData.sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
-    
-    // Check if we had to repair data - if so, save it back to IndexedDB
-    // BUT: Only repair/re-save if we actually detected corruption (Column X format)
-    const hadRepairs = txData && txData.some(t => t['Column 2']); // Check if any still have Column X format
-    if (hadRepairs || (empData && empData.some(e => e['Column 2']))) {
-      console.log('Saving repaired data back to IndexedDB...');
-      await IDB.set('ut_employees', DB_MEMORY.employees);
-      // Only clear and re-save if we detected corruption
-      if (hadRepairs) {
-        console.log('Detected corrupted transaction data, re-saving...');
-        await IDB.clearTransactions();
-        for (const t of DB_MEMORY.transactions) {
-          await IDB.saveTransaction(t);
-        }
-      }
-      hasMigratedAny = true;
-    }
-    
-    console.log('After init, DB.transactions:', DB.transactions.length, 'total');
-    if (DB.transactions.length > 0) {
-      console.log('First 3 transactions in DB_MEMORY:', DB.transactions.slice(0, 3).map(t => ({
-        id: t.id,
-        action: t.action,
-        barcode: t.barcode,
-        employeeId: t.employeeId,
-        createdAt: t.createdAt
-      })));
-    }
-    
+
     // Centres
     let cenData = await IDB.get('ut_centres');
     if (!cenData && lsCentres) { cenData = JSON.parse(lsCentres); hasMigratedAny = true; }
     if (cenData) DB_MEMORY.centres = cenData;
-    
+
     // Types
     let typeData = await IDB.get('ut_types');
     if (!typeData && lsTypes) { typeData = JSON.parse(lsTypes); hasMigratedAny = true; }
     if (typeData) DB_MEMORY.uniformTypes = typeData;
-    
+
     // Users
     let userData = await IDB.get('ut_users');
     if (!userData || userData.length === 0) {
@@ -748,38 +1120,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         { username: 'Manager', password: 'Manager123', role: 'manager' }
       ];
       hasMigratedAny = true;
-    } else {
-      // Check if we have the old default admin user and need to migrate to new users
-      const hasOldDefault = userData.some(u =>
-        u.username.toLowerCase() === 'admin' &&
-        (u.password === 'admin' || u.password === 'admin123') &&
-        u.role === 'admin'
-      );
-      
-      if (hasOldDefault) {
-        userData = [
-          { username: 'Admin', password: 'Admin1980', role: 'admin' },
-          { username: 'Operator', password: 'Oper1234', role: 'operator' },
-          { username: 'Warehouse', password: 'Wh1234', role: 'warehouse' },
-          { username: 'Manager', password: 'Manager123', role: 'manager' }
-        ];
-        hasMigratedAny = true;
-        console.log('Migrated from old admin default user to new user system');
-      }
     }
     DB_MEMORY.users = userData;
 
     if (hasMigratedAny) {
-      console.log('Migrated data from localStorage to IndexedDB');
       IDB.set('ut_employees', DB_MEMORY.employees);
-      IDB.set('ut_transactions', DB_MEMORY.transactions);
       IDB.set('ut_centres', DB_MEMORY.centres);
       IDB.set('ut_types', DB_MEMORY.uniformTypes);
       IDB.set('ut_users', DB_MEMORY.users);
     }
   } catch (e) {
-    console.error("IndexedDB Intialization failed, running empty defaults.", e);
-    // Ensure users are initialized with defaults even if IndexedDB fails
+    console.error("IndexedDB init failed, using defaults.", e);
     DB_MEMORY.users = [
       { username: 'Admin', password: 'Admin1980', role: 'admin' },
       { username: 'Operator', password: 'Oper1234', role: 'operator' },
@@ -788,7 +1139,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     ];
   }
 
-  // Auth Bootloader Check
+  // Auth check
   const activeSession = sessionStorage.getItem('ut_active_user');
   if (activeSession) {
     const user = DB_MEMORY.users.find(u => u.username === activeSession);
@@ -797,55 +1148,58 @@ document.addEventListener('DOMContentLoaded', async () => {
       document.body.setAttribute('data-role', currentUser.role);
       document.getElementById('login-overlay').classList.add('hidden');
       document.getElementById('app-wrapper').style.display = 'flex';
-      
       showPage('dashboard');
       setAction('distributed');
     }
   } else {
-    // If no auth, focus login
     setTimeout(() => {
       const lu = document.getElementById('login-user');
       if (lu) lu.focus();
     }, 100);
   }
 
+  // Close employee dropdown on outside click
   document.addEventListener('click', (e) => {
     const dd = document.getElementById('scan-emp-dropdown');
     const wrapper = document.querySelector('.emp-search-wrapper');
     if (dd && wrapper && !wrapper.contains(e.target)) dd.classList.add('hidden');
   });
 
-  // Start automatic cloud sync if configured
+  // Pre-configure Supabase if not already set up
+  // (credentials from v2 project — user can override in Settings → Database)
+  if (!localStorage.getItem('ut_cloud_url') || !localStorage.getItem('ut_cloud_key')) {
+    localStorage.setItem('ut_cloud_url', 'https://ruhovbdcnnukvobbejor.supabase.co');
+    localStorage.setItem('ut_cloud_key', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ1aG92YmRjbm51a3ZvYmJlam9yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAwMTc5NzksImV4cCI6MjA5NTU5Mzk3OX0.Yx769_aDtIdQhiiYuaDCcAq05QZPaCAhBpOxMrWm7Jc');
+  }
+  // Populate settings fields if on settings page
+  const urlEl = document.getElementById('cloud-url');
+  const keyEl = document.getElementById('cloud-key');
+  if (urlEl) urlEl.value = localStorage.getItem('ut_cloud_url') || '';
+  if (keyEl) keyEl.value = localStorage.getItem('ut_cloud_key') || '';
+
   startAutoSync();
-  
-  // Handle window resize for sidebar responsiveness
+
+  // On first load, pull from Supabase to get all cloud data
+  const isFirstLoad = !localStorage.getItem('ut_last_sync');
+  if (isFirstLoad && getSupabase()) {
+    setTimeout(() => CloudSync.pullAll(false), 1500);
+  }
+
+  // Responsive sidebar
   window.addEventListener('resize', () => {
     const sidebar = document.getElementById('sidebar');
     const main = document.querySelector('.main-content');
     const backdrop = document.getElementById('sidebar-backdrop');
-    
     if (window.innerWidth > 768) {
-      // Switched to desktop - hide backdrop, use width-based layout
       if (backdrop) backdrop.style.display = 'none';
       sidebar.classList.remove('open');
-      if (sidebarOpen) {
-        sidebar.classList.remove('closed');
-        main.classList.remove('expanded');
-      } else {
-        sidebar.classList.add('closed');
-        main.classList.add('expanded');
-      }
+      if (sidebarOpen) { sidebar.classList.remove('closed'); main.classList.remove('expanded'); }
+      else { sidebar.classList.add('closed'); main.classList.add('expanded'); }
     } else {
-      // Switched to mobile - use transform-based layout
       sidebar.classList.remove('closed');
       main.classList.remove('expanded');
-      if (sidebarOpen) {
-        sidebar.classList.add('open');
-        if (backdrop) backdrop.style.display = 'block';
-      } else {
-        sidebar.classList.remove('open');
-        if (backdrop) backdrop.style.display = 'none';
-      }
+      if (sidebarOpen) { sidebar.classList.add('open'); if (backdrop) backdrop.style.display = 'block'; }
+      else { sidebar.classList.remove('open'); if (backdrop) backdrop.style.display = 'none'; }
     }
   });
 });
@@ -858,26 +1212,17 @@ function handleLogin() {
   const p = document.getElementById('login-pass').value;
   let user = DB_MEMORY.users.find(x => x.username.toLowerCase() === u.toLowerCase() && x.password === p);
 
-  // Legacy login support for older admin passwords
   if (!user && u.toLowerCase() === 'admin' && (p === 'admin' || p === 'admin123')) {
     const adminUser = DB_MEMORY.users.find(x => x.role === 'admin');
-    if (adminUser) {
-      user = adminUser;
-      showToast('Legacy admin login accepted and migrated to new credentials.', 'info');
-    }
+    if (adminUser) { user = adminUser; showToast('Legacy admin login accepted.', 'info'); }
   }
-
-  if (!user) {
-    showToast('Invalid username or password', 'error');
-    return;
-  }
+  if (!user) { showToast('Invalid username or password', 'error'); return; }
   currentUser = user;
   sessionStorage.setItem('ut_active_user', user.username);
   document.body.setAttribute('data-role', currentUser.role);
   document.getElementById('login-overlay').classList.add('hidden');
   document.getElementById('app-wrapper').style.display = 'flex';
   document.getElementById('login-pass').value = '';
-  
   showPage('dashboard');
   setAction('distributed');
   showToast(`Welcome, ${u}!`, 'success');
@@ -885,8 +1230,7 @@ function handleLogin() {
 window.handleLogin = handleLogin;
 
 function handleLogout() {
-  console.log("handleLogout called!");
-  stopAutoSync(); // Stop automatic syncing
+  stopAutoSync();
   currentUser = null;
   sessionStorage.removeItem('ut_active_user');
   document.body.removeAttribute('data-role');
@@ -904,106 +1248,70 @@ window.handleLogout = handleLogout;
 const ROLE_PERMISSIONS = {
   admin: {
     actions: ['received_from_cintas', 'distributed', 'reported_issue', 'returned', 'collected_from_soil_bin', 'sent_to_cintas'],
-    canManageUsers: true,
-    canManageEmployees: true,
-    canDeleteTransactions: true,
-    canExportData: true
+    canManageUsers: true, canManageEmployees: true, canDeleteTransactions: true, canExportData: true
   },
   operator: {
     actions: ['received_from_cintas', 'distributed', 'reported_issue', 'returned', 'collected_from_soil_bin', 'sent_to_cintas'],
-    canManageUsers: false,
-    canManageEmployees: false,
-    canDeleteTransactions: true,
-    canExportData: false
+    canManageUsers: false, canManageEmployees: true, canDeleteTransactions: true, canExportData: false
   },
   warehouse: {
     actions: ['received_from_cintas', 'returned', 'collected_from_soil_bin', 'sent_to_cintas'],
-    canManageUsers: false,
-    canManageEmployees: false,
-    canDeleteTransactions: false,
-    canExportData: true
+    canManageUsers: false, canManageEmployees: false, canDeleteTransactions: false, canExportData: true
   },
   manager: {
     actions: [],
-    canManageUsers: false,
-    canManageEmployees: false,
-    canDeleteTransactions: false,
-    canExportData: false
+    canManageUsers: false, canManageEmployees: false, canDeleteTransactions: false, canExportData: false
   }
 };
 
 function hasPermission(action) {
   if (!currentUser) return false;
-  const permissions = ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator;
-  return permissions.actions.includes(action);
+  return (ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator).actions.includes(action);
 }
-
 function canManageUsers() {
   if (!currentUser) return false;
-  const permissions = ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator;
-  return permissions.canManageUsers;
+  return (ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator).canManageUsers;
 }
-
 function canManageEmployees() {
   if (!currentUser) return false;
-  const permissions = ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator;
-  return permissions.canManageEmployees;
+  return (ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator).canManageEmployees;
 }
-
 function canDeleteTransactions() {
   if (!currentUser) return false;
-  const permissions = ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator;
-  return permissions.canDeleteTransactions;
+  return (ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator).canDeleteTransactions;
+}
+function canExportData() {
+  if (!currentUser) return false;
+  return (ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator).canExportData;
 }
 
 function updateActionTabsVisibility() {
   if (!currentUser) return;
-  
-  const permissions = ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator;
-  const allowedActions = permissions.actions;
-  
-  // Hide/show action tabs
+  const allowedActions = (ROLE_PERMISSIONS[currentUser.role] || ROLE_PERMISSIONS.operator).actions;
   document.querySelectorAll('.action-tab').forEach(tab => {
     const action = tab.id.replace('tab-', '');
-    if (allowedActions.includes(action)) {
-      tab.style.display = 'flex';
-    } else {
-      tab.style.display = 'none';
-    }
+    tab.style.display = allowedActions.includes(action) ? 'flex' : 'none';
   });
-  
-  // If current action is not allowed, switch to first allowed action
   if (!hasPermission(currentAction)) {
     const firstAllowed = allowedActions[0];
-    if (firstAllowed) {
-      setAction(firstAllowed);
-    }
+    if (firstAllowed) setAction(firstAllowed);
   }
 }
+
+// ============================================================
+// NAVIGATION
+// ============================================================
 function toggleSidebar() {
   sidebarOpen = !sidebarOpen;
   const sidebar = document.getElementById('sidebar');
   const main    = document.querySelector('.main-content');
   const backdrop = document.getElementById('sidebar-backdrop');
-  
   if (window.innerWidth <= 768) {
-    // Mobile: use transform and backdrop
-    if (sidebarOpen) {
-      sidebar.classList.add('open');
-      if (backdrop) backdrop.style.display = 'block';
-    } else {
-      sidebar.classList.remove('open');
-      if (backdrop) backdrop.style.display = 'none';
-    }
+    if (sidebarOpen) { sidebar.classList.add('open'); if (backdrop) backdrop.style.display = 'block'; }
+    else { sidebar.classList.remove('open'); if (backdrop) backdrop.style.display = 'none'; }
   } else {
-    // Desktop: use width changes
-    if (sidebarOpen) { 
-      sidebar.classList.remove('closed'); 
-      main.classList.remove('expanded'); 
-    } else { 
-      sidebar.classList.add('closed');    
-      main.classList.add('expanded');    
-    }
+    if (sidebarOpen) { sidebar.classList.remove('closed'); main.classList.remove('expanded'); }
+    else { sidebar.classList.add('closed'); main.classList.add('expanded'); }
   }
 }
 
@@ -1017,12 +1325,9 @@ function showPage(page) {
   if (navEl) navEl.classList.add('active');
   const titles = {dashboard:'Dashboard',employees:'Employees',scan:'Scan Entry',reports:'Reports',settings:'Settings',users:'User Management'};
   document.getElementById('pageTitle').textContent = titles[page] || page;
-  // Start/stop scanner focus lock
-  if (page === 'scan') {
-    updateActionTabsVisibility();
-    startFocusLock();
-  }
-  else                 stopFocusLock();
+
+  if (page === 'scan') { updateActionTabsVisibility(); startFocusLock(); }
+  else stopFocusLock();
 
   if (page === 'dashboard') renderDashboard();
   if (page === 'employees') renderEmployeeList();
@@ -1030,37 +1335,34 @@ function showPage(page) {
   if (page === 'reports')   renderReport();
   if (page === 'settings')  renderSettings();
   if (page === 'users')     renderUsers();
+
+  // Close sidebar on mobile when navigating
+  if (window.innerWidth <= 768 && sidebarOpen) {
+    toggleSidebar();
+  }
 }
 
 // ============================================================
 // DASHBOARD
 // ============================================================
 function computeStats() {
-  const txns     = DB.transactions;
-  console.log('computeStats: Total transactions in DB:', txns.length);
-  if (txns.length > 0) {
-    console.log('First 3 transactions:', txns.slice(0, 3).map(t => ({
-      action: t.action,
-      barcode: t.barcode,
-      employeeId: t.employeeId
-    })));
-  }
-  const barcodes = [...new Set(txns.map(t => t.barcode))];
-  console.log('Unique barcodes:', barcodes.length, barcodes.slice(0, 5));
-  let out = 0, cintas = 0, warehouse = 0, issues = 0;
-  barcodes.forEach((bc, idx) => {
-    const last = txns.find(t => t.barcode === bc);
-    if (!last) return;
-    if (idx < 3) {
-      console.log(`Barcode ${bc}: action="${last.action}"`);
-    }
-    if      (last.action === 'distributed')                                        out++;
-    else if (last.action === 'sent_to_cintas')                                     cintas++;
-    else if (last.action === 'reported_issue')                                     issues++;
-    else if (last.action === 'returned' || last.action === 'received_from_cintas' || last.action === 'collected_from_soil_bin') warehouse++
+  const txns = DB.transactions;
+  // Build latest state for each barcode using the state machine
+  const latestByBarcode = {};
+  txns.forEach(t => {
+    if (!latestByBarcode[t.barcode]) latestByBarcode[t.barcode] = t;
   });
-  console.log('Stats computed - out:', out, 'cintas:', cintas, 'warehouse:', warehouse, 'issues:', issues);
-  return { total: barcodes.length, out, cintas, warehouse, issues };
+
+  let out = 0, cintas = 0, warehouse = 0, issues = 0;
+  Object.values(latestByBarcode).forEach(last => {
+    const state = ACTION_TO_STATE[last.action] || 'unknown';
+    if (state === 'with_employee') out++;
+    else if (state === 'at_cintas') cintas++;
+    else if (state === 'damaged') issues++;
+    else if (state === 'warehouse' || state === 'soil_bin') warehouse++;
+  });
+
+  return { total: Object.keys(latestByBarcode).length, out, cintas, warehouse, issues };
 }
 
 function renderDashboard() {
@@ -1079,14 +1381,15 @@ function renderDashboard() {
     return;
   }
   container.innerHTML = txns.map(t => {
-    const emp     = findEmployeeByIdOrExternal(t.employeeId);
+    const emp = findEmployeeByIdOrExternal(t.employeeId);
     const actionKey = t.action || '';
     const empName = emp ? `${emp.firstName} ${emp.lastName}` :
                     (actionKey.includes('cintas') || actionKey === 'reported_issue' ? 'Cintas' : 'Warehouse');
-    return `<div class="activity-item">
+    const inferredMark = t.inferred ? ' <span class="inferred-indicator"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15V9m0 0l-3 3m3-3l3 3"/><circle cx="12" cy="12" r="10"/></svg>inferred</span>' : '';
+    return `<div class="activity-item${t.inferred ? ' inferred' : ''}">
       <span class="activity-dot ${t.action}"></span>
       <div class="activity-info">
-        <div class="activity-barcode">${escHtml(t.barcode)}</div>
+        <div class="activity-barcode">${escHtml(t.barcode)}${inferredMark}</div>
         <div class="activity-meta">${actionLabel(t.action)} — ${escHtml(empName)}</div>
       </div>
       <div class="activity-time">${formatDateTime(t.createdAt)}</div>
@@ -1097,77 +1400,153 @@ function renderDashboard() {
 // ============================================================
 // EMPLOYEES
 // ============================================================
+function getLatestByBarcode() {
+  const latest = {};
+  DB.transactions.forEach(t => {
+    if (!latest[t.barcode]) latest[t.barcode] = t;
+  });
+  return latest;
+}
+
 function renderEmployeeList() {
-  console.log('renderEmployeeList: DB.employees count:', DB.employees.length);
-  if (DB.employees.length > 0) {
-    console.log('First 3 employees:', DB.employees.slice(0, 3).map(e => ({
-      id: e.id,
-      firstName: e.firstName,
-      lastName: e.lastName,
-      name: e.name,
-      employeeId: e.employeeId
-    })));
-  }
-  
   const query = (document.getElementById('emp-search')?.value || '').toLowerCase();
   const list  = DB.employees.filter(e => {
     const searchText = `${e.firstName || ''} ${e.lastName || ''} ${e.name || ''}`.toLowerCase();
     return !query || searchText.includes(query) ||
     (e.employeeId && String(e.employeeId).toLowerCase().includes(query)) ||
-    (e.productionCentre && String(e.productionCentre).toLowerCase().includes(query))
+    (e.productionCentre && String(e.productionCentre).toLowerCase().includes(query));
   });
-  
-  console.log('Filtered employee list:', list.length);
+
   const container = document.getElementById('employee-list');
   const canEdit = canManageEmployees();
   const addButton = document.querySelector('#page-employees .btn-primary');
-  if (addButton) {
-    addButton.style.display = canEdit ? 'inline-flex' : 'none';
-  }
+  if (addButton) addButton.style.display = canEdit ? 'inline-flex' : 'none';
+
   if (!list.length) {
-    container.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/></svg><p>${query ? 'No employees match.' : 'No employees yet. Click "Add Employee" to start.'}</p></div>`;
+    container.innerHTML = `<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/></svg><p>${query ? 'No employees match.' : 'No employees yet. Click "Add Employee" to start.'}</p></div>`;
     return;
   }
-  const txns = DB.transactions;
-  container.innerHTML = list.map(e => {
-    // Handle both separate firstName/lastName and single name field
+
+  // FIXED: Use proper latest-by-barcode for held count
+  const latestByBarcode = getLatestByBarcode();
+
+  let tableHtml = `<div class="employee-grid-table">
+    <div class="employee-grid-header">
+      <div>Employee</div>
+      <div>Department</div>
+      <div>Production Centre</div>
+      <div>Actions</div>
+    </div>`;
+
+  tableHtml += list.map(e => {
     const firstName = e.firstName || (e.name ? e.name.split(' ')[0] : '');
     const lastName = e.lastName || (e.name ? e.name.split(' ').slice(1).join(' ') : '');
     const fullName = firstName && lastName ? `${firstName} ${lastName}` : (e.name || 'Unknown Employee');
-    
     const color = avatarColor(fullName);
     const ini   = initials(firstName, lastName) || initials(e.name || '', '');
-    const myBarcodes = [...new Set(txns.filter(t => t.employeeId === e.id || t.employeeId === e.employeeId).map(t => t.barcode))];
-    const held = myBarcodes.filter(bc => { const l = txns.find(t => t.barcode === bc); return l && l.action === 'distributed'; }).length;
-    return `<div class="emp-card" onclick="showEmployeeDetail('${e.id}')">
-      <div class="emp-card-header">
-        <div class="emp-avatar" style="background:${color}">${escHtml(ini)}</div>
-        <div><div class="emp-name">${escHtml(fullName)}</div><div class="emp-id">${escHtml(e.employeeId||'—')}</div></div>
+
+    // FIXED: Get barcodes associated with this employee, check GLOBAL latest state
+    const myBarcodes = [...new Set(
+      DB.transactions.filter(t => t.employeeId === e.id || t.employeeId === e.employeeId).map(t => t.barcode)
+    )];
+    const held = myBarcodes.filter(bc => {
+      const latest = latestByBarcode[bc];
+      return latest && latest.action === 'distributed' && (latest.employeeId === e.id || latest.employeeId === e.employeeId);
+    }).length;
+
+    // Mobile metadata pills
+    const pills = [];
+    if (e.productionCentre) pills.push(`<span class="emp-mobile-pill">${escHtml(e.productionCentre)}</span>`);
+    if (e.department) pills.push(`<span class="emp-mobile-pill">${escHtml(e.department)}</span>`);
+    const pillsHtml = pills.length ? `<div class="emp-mobile-meta-pills">${pills.join('')}</div>` : '';
+
+    return `<div class="employee-grid-row" data-id="${e.id}">
+      <div class="emp-row-info" onclick="showEmployeeDetail('${e.id}')">
+        <div>
+          <div class="emp-avatar-name-cell">
+            <div class="emp-avatar" style="background:${color}">${escHtml(ini)}</div>
+            <div class="emp-name-held-wrap">
+              <div class="emp-table-name">${escHtml(fullName)}</div>
+              <div class="emp-table-held">Holding: <strong>${held}</strong> uniform${held!==1?'s':''}</div>
+              ${pillsHtml}
+            </div>
+          </div>
+        </div>
+        <div class="emp-table-dept">${escHtml(e.department || '—')}</div>
+        <div class="emp-table-centre">${escHtml(e.productionCentre || '—')}</div>
       </div>
-      <div class="emp-tags">
-        ${e.productionCentre ? `<span class="emp-tag centre">${escHtml(e.productionCentre)}</span>` : ''}
-        ${e.department       ? `<span class="emp-tag dept">${escHtml(e.department)}</span>` : ''}
-      </div>
-      <div class="emp-card-footer">
-        <div class="emp-uniform-count">Holding: <strong>${held}</strong> uniform${held!==1?'s':''}</div>
-        <div class="emp-card-actions" onclick="event.stopPropagation()">
-          ${canEdit ? `<button class="emp-action-btn" title="Edit" onclick="openEmployeeModal('${e.id}')">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-          </button>
-          <button class="emp-action-btn del" title="Delete" onclick="deleteEmployee('${e.id}')">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
-          </button>` : ''}
+      <div class="emp-row-actions" onclick="event.stopPropagation()">
+        <div class="emp-actions-cell">
+          <div class="emp-actions-flex">
+            <!-- Mobile Close Button -->
+            <button class="emp-action-btn mobile-close-btn" title="Back" onclick="toggleRowActions('${e.id}', false)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+            </button>
+            
+            <button class="emp-action-btn" title="View Detail" onclick="showEmployeeDetail('${e.id}')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+            
+            ${canEdit ? `
+              <button class="emp-action-btn" title="Edit" onclick="openEmployeeModal('${e.id}')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              </button>
+              <button class="emp-action-btn del" title="Delete" onclick="deleteEmployee('${e.id}')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
+              </button>
+            ` : ''}
+            
+            <!-- Mobile Trigger Button -->
+            <button class="emp-action-btn mobile-trigger-btn" title="Actions" onclick="toggleRowActions('${e.id}', true)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg>
+            </button>
+          </div>
         </div>
       </div>
     </div>`;
   }).join('');
+
+  tableHtml += `</div>`;
+  container.innerHTML = tableHtml;
+  
+  // Add mobile touch swipe left/right detection to each row
+  setTimeout(() => {
+    document.querySelectorAll('.employee-grid-row').forEach(row => {
+      let touchStartX = 0;
+      let touchEndX = 0;
+      
+      row.addEventListener('touchstart', (e) => {
+        touchStartX = e.changedTouches[0].screenX;
+      }, { passive: true });
+      
+      row.addEventListener('touchend', (e) => {
+        touchEndX = e.changedTouches[0].screenX;
+        const diffX = touchStartX - touchEndX;
+        const id = row.getAttribute('data-id');
+        if (diffX > 50) {
+          toggleRowActions(id, true);
+        } else if (diffX < -50) {
+          toggleRowActions(id, false);
+        }
+      }, { passive: true });
+    });
+  }, 100);
 }
 
-function openEmployeeModal(id) {
-  if (!canManageEmployees()) {
-    showToast('Access denied. Only Admin can manage employees.', 'error');
-    return;
+function toggleRowActions(id, show) {
+  const row = document.querySelector(`.employee-grid-row[data-id="${id}"]`);
+  if (row) {
+    if (show) {
+      row.classList.add('swipe-active');
+    } else {
+      row.classList.remove('swipe-active');
+    }
   }
+}
+window.toggleRowActions = toggleRowActions;
+
+function openEmployeeModal(id) {
+  if (!canManageEmployees()) { showToast('Access denied.', 'error'); return; }
   document.getElementById('emp-modal-title').textContent = id ? 'Edit Employee' : 'Add Employee';
   document.getElementById('emp-id').value = id || '';
   const sel = document.getElementById('emp-centre');
@@ -1184,24 +1563,20 @@ function openEmployeeModal(id) {
       document.getElementById('emp-notes').value  = e.notes || '';
     }
   } else {
-    ['emp-first','emp-last','emp-empid','emp-dept','emp-phone','emp-notes'].forEach(fid => { document.getElementById(fid).value = ''; });
+    ['emp-first','emp-last','emp-empid','emp-dept','emp-phone','emp-notes'].forEach(fid => document.getElementById(fid).value = '');
     document.getElementById('emp-centre').value = '';
   }
   openModal('employee-modal');
 }
 
 function saveEmployee() {
-  if (!canManageEmployees()) {
-    showToast('Access denied. Only Admin can manage employees.', 'error');
-    return;
-  }
+  if (!canManageEmployees()) { showToast('Access denied.', 'error'); return; }
   const first = document.getElementById('emp-first').value.trim();
   const last  = document.getElementById('emp-last').value.trim();
-  if (!first || !last) { showToast('First and last name are required.', 'error'); return; }
+  if (!first || !last) { showToast('First and last name required.', 'error'); return; }
   const id   = document.getElementById('emp-id').value;
   const data = {
-    id: id || uid(),
-    firstName: first, lastName: last,
+    id: id || uid(), firstName: first, lastName: last,
     employeeId: document.getElementById('emp-empid').value.trim(),
     productionCentre: document.getElementById('emp-centre').value,
     department: document.getElementById('emp-dept').value.trim(),
@@ -1210,8 +1585,12 @@ function saveEmployee() {
     createdAt: new Date().toISOString()
   };
   let list = DB.employees;
-  if (id) { const idx = list.findIndex(e => e.id === id); if (idx >= 0) { data.createdAt = list[idx].createdAt; list[idx] = data; } }
-  else    { list.push(data); }
+  if (id) {
+    const idx = list.findIndex(e => e.id === id);
+    if (idx >= 0) { data.createdAt = list[idx].createdAt; list[idx] = data; }
+  } else {
+    list.push(data);
+  }
   DB.saveEmployees(list);
   CloudSync.pushEmployee(data);
   closeModal('employee-modal');
@@ -1220,13 +1599,10 @@ function saveEmployee() {
 }
 
 function deleteEmployee(id) {
-  if (!canManageEmployees()) {
-    showToast('Access denied. Only Admin can delete employees.', 'error');
-    return;
-  }
+  if (!canManageEmployees()) { showToast('Access denied.', 'error'); return; }
   const e = DB.employees.find(emp => emp.id === id);
   if (!e) return;
-  confirm_dialog(`Delete ${e.firstName} ${e.lastName}?`, 'This employee will be removed. Their transaction history will be kept.', () => {
+  confirm_dialog(`Delete ${e.firstName} ${e.lastName}?`, 'This employee will be removed. Transaction history is kept.', () => {
     DB.saveEmployees(DB.employees.filter(emp => emp.id !== id));
     CloudSync.removeEmployee(id);
     showToast('Employee deleted.', 'success');
@@ -1237,16 +1613,18 @@ function deleteEmployee(id) {
 function showEmployeeDetail(id) {
   const e = DB.employees.find(emp => emp.id === id);
   if (!e) return;
-  
   document.getElementById('emp-detail-name').textContent = `${e.firstName} ${e.lastName}`;
-  
-  const txns = DB.transactions.filter(t => t.employeeId === id);
-  const myBarcodes = [...new Set(txns.map(t => t.barcode))];
-  const held = myBarcodes.filter(bc => { 
-    const last = txns.filter(t => t.barcode === bc).sort((a,b) => new Date(b.date) - new Date(a.date))[0];
-    return last && last.action === 'distributed'; 
+
+  // FIXED: Use global latest-by-barcode for accurate held count
+  const latestByBarcode = getLatestByBarcode();
+  const myBarcodes = [...new Set(
+    DB.transactions.filter(t => t.employeeId === id).map(t => t.barcode)
+  )];
+  const held = myBarcodes.filter(bc => {
+    const latest = latestByBarcode[bc];
+    return latest && latest.action === 'distributed' && latest.employeeId === id;
   }).length;
-  
+
   document.getElementById('emp-detail-info').innerHTML = `
     <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap:12px; margin-bottom:20px">
       <div class="emp-detail-field" style="background:rgba(59,130,246,0.05); padding:12px; border-radius:8px">
@@ -1267,13 +1645,14 @@ function showEmployeeDetail(id) {
     ].map(([l,v]) => `<div class="emp-detail-field"><label>${l}</label><span>${escHtml(v)}</span></div>`).join('')}
   `;
 
+  const txns = DB.transactions.filter(t => t.employeeId === id);
   const detailEl = document.getElementById('emp-detail-uniforms');
   if (!txns.length) {
-    detailEl.innerHTML = '<div class="empty-state"><p>No uniform transactions found for this employee.</p></div>';
+    detailEl.innerHTML = '<div class="empty-state"><p>No uniform transactions found.</p></div>';
   } else {
     detailEl.innerHTML = `<div class="report-table-wrap"><table class="report-table">
       <thead><tr><th>Barcode</th><th>Action</th><th>Date</th><th>Notes</th></tr></thead>
-      <tbody>${txns.sort((a,b) => new Date(b.date) - new Date(a.date)).map(t => `<tr>
+      <tbody>${txns.sort((a,b) => new Date(b.date) - new Date(a.date)).map(t => `<tr class="${t.inferred ? 'inferred-row' : ''}">
         <td class="bc-mono">${escHtml(t.barcode)}</td>
         <td><span class="report-badge ${t.action==='distributed'?'out':t.action==='returned'?'returned':t.action==='reported_issue'?'issue':'cintas'}">${actionLabel(t.action)}</span></td>
         <td>${formatDate(t.date)}</td>
@@ -1288,94 +1667,85 @@ function showEmployeeDetail(id) {
 // SCAN ENTRY
 // ============================================================
 function setAction(action) {
-  // Check permissions
   if (!hasPermission(action)) {
-    showToast(`Access denied. Your role cannot perform "${actionLabel(action)}" actions.`, 'error');
+    showToast(`Access denied for "${actionLabel(action)}".`, 'error');
     return;
   }
-
   currentAction = action;
   document.querySelectorAll('.action-tab').forEach(t => t.classList.remove('active'));
   const tab = document.getElementById('tab-' + action);
   if (tab) tab.classList.add('active');
 
-  const selector      = document.getElementById('employee-selector');
+  const selector = document.getElementById('employee-selector');
   const needsEmployee = action === 'distributed' || action === 'returned' || action === 'collected_from_soil_bin';
   selector.style.display = needsEmployee ? 'block' : 'none';
 
-  // Update scanner hint text
   const hints = {
     received_from_cintas: 'Scan each item arriving from Cintas',
     distributed:          'Select employee above — then scan each item',
     reported_issue:       'Scan damaged / dirty items to flag them',
     returned:             'Scan each item being returned to warehouse',
-    collected_from_soil_bin: 'Select employee — then scan items collected from their soil bin',
+    collected_from_soil_bin: 'Select employee — then scan items collected from soil bin',
     sent_to_cintas:       'Scan each item going back to Cintas'
   };
   const hintEl = document.getElementById('scannerHintText');
   if (hintEl) hintEl.textContent = hints[action] || '';
 
-  // Return focus to scanner after switching action
+  // Clear state info display
+  const stateInfoEl = document.getElementById('scan-state-info');
+  if (stateInfoEl) stateInfoEl.innerHTML = '';
+
   setTimeout(() => {
     const inp = document.getElementById('barcodeInput');
     if (inp) inp.focus();
   }, 80);
 }
 
-// ---- Focus lock: keeps barcode input focused while on scan page ----
+// Focus lock
 function startFocusLock() {
-  stopFocusLock(); // clear any existing
+  stopFocusLock();
   focusLockInterval = setInterval(() => {
     if (currentPage !== 'scan') { stopFocusLock(); return; }
     const active = document.activeElement;
     const inp    = document.getElementById('barcodeInput');
-    // Do NOT steal focus from employee search or modal inputs
     const allowed = ['scan-emp-search', 'barcodeInput', 'scan-date', 'manual-barcode', 'manual-notes'];
     if (inp && active && !allowed.includes(active.id) && !active.closest('.modal-overlay')) {
       inp.focus();
     }
   }, 350);
 }
-
 function stopFocusLock() {
   if (focusLockInterval) { clearInterval(focusLockInterval); focusLockInterval = null; }
 }
 
-// ---- Scanner zone UI events ----
+// Scanner zone UI
 function onScannerFocus() {
-  const dot    = document.getElementById('scannerDot');
+  const dot = document.getElementById('scannerDot');
   const status = document.getElementById('scannerStatusText');
-  const zone   = document.getElementById('scannerZone');
-  if (dot)    dot.classList.add('active');
+  const zone = document.getElementById('scannerZone');
+  if (dot) dot.classList.add('active');
   if (status) status.textContent = 'SCANNER ACTIVE';
-  if (zone)   zone.classList.add('focused');
+  if (zone) zone.classList.add('focused');
 }
 
 function onScannerBlur() {
-  // Only update UI if focus didn't move to scanner-related elements
   setTimeout(() => {
-    const active = document.activeElement;
-    if (active && active.id === 'barcodeInput') return; // refocused immediately
-    const dot    = document.getElementById('scannerDot');
+    if (document.activeElement && document.activeElement.id === 'barcodeInput') return;
+    const dot = document.getElementById('scannerDot');
     const status = document.getElementById('scannerStatusText');
-    const zone   = document.getElementById('scannerZone');
-    if (dot)    dot.classList.remove('active');
+    const zone = document.getElementById('scannerZone');
+    if (dot) dot.classList.remove('active');
     if (status) status.textContent = 'SCANNER READY';
-    if (zone)   zone.classList.remove('focused');
+    if (zone) zone.classList.remove('focused');
   }, 100);
 }
 
 function onBarcodeInput() {
-  // Show typing feedback while barcode chars are coming in
   const val    = document.getElementById('barcodeInput').value;
   const status = document.getElementById('scannerStatusText');
   if (status && val) {
     const validation = validateBarcode(val);
-    if (validation.valid) {
-      status.textContent = `✓ READY (${val.length} chars)`;
-    } else {
-      status.textContent = `⚠ INCOMPLETE (${val.length}/${BARCODE_CONFIG.minLength} chars)`;
-    }
+    status.textContent = validation.valid ? `✓ READY (${val.length} chars)` : `⚠ INCOMPLETE (${val.length}/${BARCODE_CONFIG.minLength} chars)`;
   }
 }
 
@@ -1417,7 +1787,6 @@ function selectEmployee(id) {
       <div class="sel-emp-meta">${escHtml(e.employeeId||'')}${e.productionCentre?' · '+escHtml(e.productionCentre):''}</div>
     </div>`;
   badge.classList.remove('hidden');
-  // Immediately return focus to barcode scanner
   setTimeout(() => document.getElementById('barcodeInput').focus(), 30);
 }
 
@@ -1430,162 +1799,173 @@ function clearEmployee() {
 }
 
 // ============================================================
-//  BARCODE VALIDATION
+// BARCODE VALIDATION
 // ============================================================
-const BARCODE_CONFIG = {
-  minLength: 13,          // Reject barcodes shorter than this
-  maxLength: 15,          // Reject barcodes longer than this
-  allowPartialSubmit: false // If false, sound error for incomplete barcodes
-};
+const BARCODE_CONFIG = { minLength: 13, maxLength: 15 };
 
-// Play error sound
 function playErrorSound() {
   try {
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    const oscillator = audioContext.createOscillator();
-    const gainNode = audioContext.createGain();
-    
-    oscillator.connect(gainNode);
-    gainNode.connect(audioContext.destination);
-    
-    // Error beep: low frequency, short duration
-    oscillator.frequency.setValueAtTime(200, audioContext.currentTime);
-    oscillator.frequency.setValueAtTime(150, audioContext.currentTime + 0.1);
-    
-    gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
-    gainNode.gain.setValueAtTime(0, audioContext.currentTime + 0.15);
-    
-    oscillator.start(audioContext.currentTime);
-    oscillator.stop(audioContext.currentTime + 0.15);
-  } catch (e) {
-    console.warn('Could not play error sound:', e.message);
-  }
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.setValueAtTime(200, ctx.currentTime);
+    osc.frequency.setValueAtTime(150, ctx.currentTime + 0.1);
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.setValueAtTime(0, ctx.currentTime + 0.15);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.15);
+  } catch (e) {}
 }
 
-// Validate barcode format and length
 function validateBarcode(barcode) {
   barcode = (barcode || '').trim();
-  
-  // Check if empty
-  if (!barcode) {
-    return { valid: false, reason: 'Barcode is empty' };
-  }
-  
-  // Check if only digits
-  if (!/^\d+$/.test(barcode)) {
-    return { valid: false, reason: 'Barcode must contain only digits (0-9)' };
-  }
-  
-  // Check minimum length
-  if (barcode.length < BARCODE_CONFIG.minLength) {
-    return { valid: false, reason: `Barcode too short (${barcode.length} digits). Must be 13-15 digits.` };
-  }
-  
-  // Check maximum length
-  if (barcode.length > BARCODE_CONFIG.maxLength) {
-    return { valid: false, reason: `Barcode too long (${barcode.length} digits). Must be 13-15 digits.` };
-  }
-  
-  // Check for common scanner issues (e.g., multiple line breaks, null chars)
-  if (/[\x00\n\r]/g.test(barcode)) {
-    return { valid: false, reason: 'Barcode contains invalid characters. Scan may be corrupted.' };
-  }
-  
+  if (!barcode) return { valid: false, reason: 'Barcode is empty' };
+  if (!/^\d+$/.test(barcode)) return { valid: false, reason: 'Barcode must contain only digits (0-9)' };
+  if (barcode.length < BARCODE_CONFIG.minLength) return { valid: false, reason: `Too short (${barcode.length}). Must be 13-15 digits.` };
+  if (barcode.length > BARCODE_CONFIG.maxLength) return { valid: false, reason: `Too long (${barcode.length}). Must be 13-15 digits.` };
   return { valid: true, reason: '' };
 }
 
-function handleBarcodeKey(e) { 
-  if (e.key === 'Enter') { 
+function handleBarcodeKey(e) {
+  if (e.key === 'Enter') {
     e.preventDefault();
-    // Validate before submitting
     const barcode = document.getElementById('barcodeInput').value.trim();
     const validation = validateBarcode(barcode);
     if (!validation.valid) {
       playErrorSound();
       showToast(`⚠ Invalid Barcode: ${validation.reason}`, 'error');
+      document.getElementById('barcodeInput').value = '';
       return;
     }
     submitScan();
   }
 }
 
-// Check if barcode was already logged with the same action on the same date
 function checkDuplicate(barcode, action, date) {
-  const txns = DB.transactions;
-  return txns.find(t =>
-    t.barcode === barcode &&
-    t.action  === action  &&
-    t.date    === date
-  ) || null;
+  return DB.transactions.find(t => t.barcode === barcode && t.action === action && t.date === date) || null;
 }
 
-// Flash the scanner zone RED (duplicate warning)
 function flashDuplicateWarning(barcode) {
   const zone   = document.getElementById('scannerZone');
   const dot    = document.getElementById('scannerDot');
   const status = document.getElementById('scannerStatusText');
-  if (zone)   { zone.classList.add('dup-warning');   setTimeout(() => zone.classList.remove('dup-warning'),   1500); }
-  if (dot)    { dot.classList.add('dup-dot');         setTimeout(() => dot.classList.remove('dup-dot'),         1500); }
+  if (zone) { zone.classList.add('dup-warning'); setTimeout(() => zone.classList.remove('dup-warning'), 1500); }
+  if (dot)  { dot.classList.add('dup-dot'); setTimeout(() => dot.classList.remove('dup-dot'), 1500); }
   if (status) {
     status.textContent = `⚠ DUPLICATE: ${barcode}`;
     setTimeout(() => { if (status) status.textContent = 'SCANNER ACTIVE'; }, 1600);
   }
 }
 
+// ============================================================
+// SMART SCAN SUBMISSION (with State Machine + Inference)
+// ============================================================
 function submitScan() {
   const barcode = document.getElementById('barcodeInput').value.trim();
-  
-  // ---- BARCODE VALIDATION ----
   const validation = validateBarcode(barcode);
   if (!validation.valid) {
     playErrorSound();
-    showToast(`⚠ Invalid Barcode: ${validation.reason}`, 'error');
-    // Don't clear input; let user try again or edit
+    showToast(`⚠ Invalid: ${validation.reason}`, 'error');
     return;
   }
 
   const needsEmployee = currentAction === 'distributed' || currentAction === 'returned' || currentAction === 'collected_from_soil_bin';
   if ((currentAction === 'distributed' || currentAction === 'collected_from_soil_bin') && !selectedEmployee) {
     showToast('Please select an employee first.', 'error');
+    document.getElementById('barcodeInput').value = '';
     document.getElementById('scan-emp-search').focus();
     return;
   }
 
   const date = normalizeDate(document.getElementById('scan-date').value || today());
 
-  // ---- Duplicate check ----
+  // Duplicate check
   const dup = checkDuplicate(barcode, currentAction, date);
   if (dup) {
     flashDuplicateWarning(barcode);
     const dupEmp = dup.employeeName ? ` (${dup.employeeName})` : '';
     confirm_dialog(
       `⚠ Duplicate Barcode Detected`,
-      `Barcode "${barcode}" was already logged as "${actionLabel(currentAction)}"${dupEmp} on ${formatDate(date)}. Save it again anyway?`,
-      () => doSaveScan(barcode, currentAction, date, '')   // user confirmed
+      `Barcode "${barcode}" was already logged as "${actionLabel(currentAction)}"${dupEmp} on ${formatDate(date)}. Save again?`,
+      () => doSaveScanWithInference(barcode, currentAction, date, '')
     );
-    // Clear input so scanner is ready for next item
     document.getElementById('barcodeInput').value = '';
     setTimeout(() => document.getElementById('barcodeInput').focus(), 20);
     return;
   }
 
-  doSaveScan(barcode, currentAction, date, '');
+  // STATE MACHINE VALIDATION + INFERENCE
+  const result = validateTransition(barcode, currentAction, date, selectedEmployee?.id);
+
+  if (result.inferences.length > 0) {
+    // Show inference confirmation
+    const inferenceHtml = result.inferences.map(inf =>
+      `<li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15V9m0 0l-3 3m3-3l3 3"/><circle cx="12" cy="12" r="10"/></svg>${actionLabel(inf.action)}${inf.employeeName ? ' — ' + escHtml(inf.employeeName) : ''} (${formatDate(inf.date)})</li>`
+    ).join('');
+
+    confirm_dialog(
+      '⚙ Auto-Inferred Steps Required',
+      `<div style="margin-bottom:12px">${result.warnings.join('<br>')}</div>
+       <div style="font-size:0.85rem;color:var(--text2);margin-bottom:8px">The following steps will be auto-created:</div>
+       <ul class="inference-list">${inferenceHtml}</ul>
+       <div style="font-size:0.82rem;color:var(--text3)">These inferred steps are marked with ⚙ and can be edited later.</div>`,
+      () => doSaveScanWithInference(barcode, currentAction, date, ''),
+      true // use innerHTML for message
+    );
+    document.getElementById('barcodeInput').value = '';
+    setTimeout(() => document.getElementById('barcodeInput').focus(), 20);
+    return;
+  }
+
+  // Show warnings if any
+  if (result.warnings.length > 0) {
+    result.warnings.forEach(w => showToast(`ℹ ${w}`, 'info'));
+  }
+
+  doSaveScanWithInference(barcode, currentAction, date, '');
+}
+
+function doSaveScanWithInference(barcode, action, date, notes) {
+  // Re-validate and get inferences
+  const result = validateTransition(barcode, action, date, selectedEmployee?.id);
+
+  // Save inferred transactions first
+  for (const inf of result.inferences) {
+    const inferTxn = {
+      id: uid(),
+      barcode: inf.barcode,
+      action: inf.action,
+      employeeId: inf.employeeId || null,
+      employeeName: inf.employeeName || null,
+      date: inf.date,
+      notes: inf.notes,
+      inferred: true,
+      createdAt: new Date().toISOString()
+    };
+    DB.addTransaction(inferTxn);
+    CloudSync.pushTransaction(inferTxn);
+  }
+
+  // Save actual scan
+  doSaveScan(barcode, action, date, notes);
 }
 
 function doSaveScan(barcode, action, date, notes) {
   const needsEmployee = action === 'distributed' || action === 'returned' || action === 'collected_from_soil_bin';
-  
-  // For soil bin collections, automatically add a note
+
   let finalNotes = notes;
   if (action === 'collected_from_soil_bin') {
     finalNotes = (notes ? notes + ' • ' : '') + 'Collected from soil bin';
   }
-  
+
   const txn = {
     id: uid(), barcode, action,
     employeeId:   (needsEmployee && selectedEmployee) ? selectedEmployee.id   : null,
     employeeName: (needsEmployee && selectedEmployee) ? `${selectedEmployee.firstName} ${selectedEmployee.lastName}` : null,
     date, notes: finalNotes,
+    inferred: false,
     createdAt: new Date().toISOString()
   };
 
@@ -1593,7 +1973,7 @@ function doSaveScan(barcode, action, date, notes) {
   CloudSync.pushTransaction(txn);
   sessionScans++;
 
-  // Flash scanner zone green
+  // Visual feedback
   const wrapper = document.getElementById('barcodeWrapper');
   const zone    = document.getElementById('scannerZone');
   const dot     = document.getElementById('scannerDot');
@@ -1613,7 +1993,7 @@ function doSaveScan(barcode, action, date, notes) {
   setTimeout(() => document.getElementById('barcodeInput').focus(), 20);
 }
 
-// ---- Manual entry fallback ----
+// Manual entry
 function openManualEntry() {
   document.getElementById('manual-barcode').value = '';
   const mn = document.getElementById('manual-notes');
@@ -1637,15 +2017,13 @@ function manualSubmit() {
   const date  = normalizeDate(document.getElementById('scan-date').value || today());
   const notes = (document.getElementById('manual-notes')?.value || '').trim();
 
-  // ---- Duplicate check ----
   const dup = checkDuplicate(barcode, currentAction, date);
   if (dup) {
-    const dupEmp = dup.employeeName ? ` (${dup.employeeName})` : '';
     confirm_dialog(
-      `⚠ Duplicate Barcode Detected`,
-      `Barcode "${barcode}" was already logged as "${actionLabel(currentAction)}"${dupEmp} on ${formatDate(date)}. Save it again anyway?`,
+      `⚠ Duplicate Barcode`,
+      `"${barcode}" already logged as "${actionLabel(currentAction)}" on ${formatDate(date)}. Save again?`,
       () => {
-        doSaveScan(barcode, currentAction, date, notes);
+        doSaveScanWithInference(barcode, currentAction, date, notes);
         document.getElementById('manual-barcode').value = '';
         if (document.getElementById('manual-notes')) document.getElementById('manual-notes').value = '';
         setTimeout(() => document.getElementById('manual-barcode').focus(), 80);
@@ -1654,7 +2032,7 @@ function manualSubmit() {
     return;
   }
 
-  doSaveScan(barcode, currentAction, date, notes);
+  doSaveScanWithInference(barcode, currentAction, date, notes);
   document.getElementById('manual-barcode').value = '';
   if (document.getElementById('manual-notes')) document.getElementById('manual-notes').value = '';
   setTimeout(() => document.getElementById('manual-barcode').focus(), 80);
@@ -1667,7 +2045,7 @@ function updateScanFeed(txn) {
   const empty   = feed.querySelector('.empty-state');
   if (empty) empty.remove();
   const item = document.createElement('div');
-  item.className = 'scan-feed-item new';
+  item.className = 'scan-feed-item new' + (txn.inferred ? ' inferred' : '');
   item.innerHTML = `
     <span class="scan-num">${sessionScans}</span>
     <div><div class="scan-bc">${escHtml(txn.barcode)}</div><div class="scan-emp">${escHtml(empStr)}</div></div>
@@ -1696,7 +2074,8 @@ function renderReport() {
   const txns      = DB.transactions;
   const employees = DB.employees;
 
-  function latestTxn(barcode) { return txns.find(t => t.barcode === barcode); }
+  const latestByBarcode = getLatestByBarcode();
+
   function inRange(dateStr) {
     if (!dateStr) return true;
     if (from && dateStr < from) return false;
@@ -1704,35 +2083,30 @@ function renderReport() {
     return true;
   }
 
-  // ---- MISSING UNIFORMS (core report) ----
+  // ---- MISSING UNIFORMS ----
   if (currentReport === 'missing') {
-    const barcodes = [...new Set(txns.map(t => t.barcode))];
     const missingItems = [];
-
-    barcodes.forEach(bc => {
-      const lastTxn = latestTxn(bc);
-      if (!lastTxn || lastTxn.action !== 'distributed') return;
+    Object.entries(latestByBarcode).forEach(([bc, lastTxn]) => {
+      if (lastTxn.action !== 'distributed') return;
       const emp = findEmployeeByIdOrExternal(lastTxn.employeeId);
       const row = {
         barcode: bc,
-        employeeId:    lastTxn.employeeId,
-        employeeName:  emp ? `${emp.firstName} ${emp.lastName}` : '— Unknown —',
+        employeeId: lastTxn.employeeId,
+        employeeName: emp ? `${emp.firstName} ${emp.lastName}` : '— Unknown —',
         employeeEmpId: emp?.employeeId || '',
-        centre:        emp?.productionCentre || '—',
-        department:    emp?.department || '—',
-        date:          lastTxn.date,
-        notes:         lastTxn.notes || '',
-        days:          Math.floor((Date.now() - new Date(lastTxn.date)) / 86400000)
+        centre: emp?.productionCentre || '—',
+        department: emp?.department || '—',
+        date: lastTxn.date,
+        notes: lastTxn.notes || '',
+        days: Math.floor((Date.now() - new Date(lastTxn.date)) / 86400000)
       };
-      if (from && lastTxn.date < from) return;
-      if (to   && lastTxn.date > to)   return;
+      if (!inRange(lastTxn.date)) return;
       if (q && !String(bc).toLowerCase().includes(q) &&
                !String(row.employeeName).toLowerCase().includes(q) &&
                !String(row.centre).toLowerCase().includes(q) &&
                !String(row.employeeEmpId).toLowerCase().includes(q)) return;
       missingItems.push(row);
     });
-
     missingItems.sort((a,b) => b.days - a.days);
 
     // Group by employee
@@ -1744,13 +2118,12 @@ function renderReport() {
     });
 
     const urgentCount = missingItems.filter(r => r.days > 7).length;
-
     container.innerHTML = `
       <div class="missing-banner ${missingItems.length > 0 ? 'has-missing' : 'all-clear'}">
         <div class="missing-banner-icon">${missingItems.length > 0 ? '⚠' : '✓'}</div>
         <div>
           <div class="missing-banner-title">${missingItems.length > 0 ? missingItems.length + ' Uniform' + (missingItems.length !== 1 ? 's' : '') + ' Not Returned' : 'All Uniforms Returned!'}</div>
-          <div class="missing-banner-sub">${missingItems.length > 0 ? urgentCount + ' item' + (urgentCount !== 1 ? 's' : '') + ' overdue >7 days &middot; Grouped by employee below' : 'No outstanding uniforms at this time.'}</div>
+          <div class="missing-banner-sub">${missingItems.length > 0 ? urgentCount + ' item' + (urgentCount !== 1 ? 's' : '') + ' overdue >7 days' : 'No outstanding uniforms.'}</div>
         </div>
         <button class="btn-secondary" style="margin-left:auto" onclick="exportCSV()">Export CSV</button>
       </div>
@@ -1759,43 +2132,39 @@ function renderReport() {
           <div class="missing-emp-header">
             <div class="emp-avatar" style="width:36px;height:36px;font-size:0.82rem;background:${avatarColor(grp.name)}">${grp.name.split(' ').map(w=>w[0]).join('').slice(0,2)}</div>
             <div>
-              <div style="font-weight:700;color:var(--text)">${escHtml(grp.name)} <span style="color:var(--text3);font-size:0.78rem;font-weight:400">${escHtml(grp.empId ? '&middot; ' + grp.empId : '')}</span></div>
-              <div style="font-size:0.76rem;color:var(--text3)">${escHtml(grp.centre)}${grp.dept ? ' &middot; ' + escHtml(grp.dept) : ''}</div>
+              <div style="font-weight:700;color:var(--text)">${escHtml(grp.name)} <span style="color:var(--text3);font-size:0.78rem;font-weight:400">${escHtml(grp.empId ? '· ' + grp.empId : '')}</span></div>
+              <div style="font-size:0.76rem;color:var(--text3)">${escHtml(grp.centre)}${grp.dept ? ' · ' + escHtml(grp.dept) : ''}</div>
             </div>
             <span class="missing-count-badge">${grp.items.length} item${grp.items.length !== 1 ? 's' : ''}</span>
           </div>
           <div class="report-table-wrap" style="margin:0;border-top:none;border-radius:0 0 10px 10px">
             <table class="report-table">
               <thead><tr><th>Barcode</th><th>Date Out</th><th>Days Out</th><th>Notes</th></tr></thead>
-              <tbody>
-                ${grp.items.map(r => `<tr>
-                  <td class="bc-mono">${escHtml(r.barcode)}</td>
-                  <td>${formatDate(r.date)}</td>
-                  <td><span class="days-pill ${r.days > 14 ? 'overdue' : r.days > 7 ? 'warning' : 'ok'}">${r.days}d</span></td>
-                  <td style="color:var(--text3)">${escHtml(r.notes)}</td>
-                </tr>`).join('')}
-              </tbody>
+              <tbody>${grp.items.map(r => `<tr>
+                <td class="bc-mono">${escHtml(r.barcode)}</td>
+                <td>${formatDate(r.date)}</td>
+                <td><span class="days-pill ${r.days > 14 ? 'overdue' : r.days > 7 ? 'warning' : 'ok'}">${r.days}d</span></td>
+                <td style="color:var(--text3)">${escHtml(r.notes)}</td>
+              </tr>`).join('')}</tbody>
             </table>
           </div>
         </div>
       `).join('')}
-      ${missingItems.length === 0 ? '<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg><p>No missing uniforms found.</p></div>' : ''}
+      ${missingItems.length === 0 ? '<div class="empty-state"><p>No missing uniforms found.</p></div>' : ''}
     `;
 
-  // ---- REPORTED ISSUES ----
+  // ---- ISSUES / DAMAGED ----
   } else if (currentReport === 'issues') {
-    const barcodes = [...new Set(txns.map(t => t.barcode))];
     const rows = [];
-    barcodes.forEach(bc => {
-      const last = latestTxn(bc);
-      if (!last || last.action !== 'reported_issue') return;
+    Object.entries(latestByBarcode).forEach(([bc, last]) => {
+      if (last.action !== 'reported_issue') return;
       if (!inRange(last.date)) return;
       if (q && !String(bc).toLowerCase().includes(q)) return;
       rows.push({ barcode: bc, date: last.date, notes: last.notes || '' });
     });
     container.innerHTML = `
       <div class="report-summary">
-        <div class="rs-card"><div class="rs-num" style="color:var(--yellow)">${rows.length}</div><div class="rs-label">Items Reported Damaged/Dirty</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--yellow)">${rows.length}</div><div class="rs-label">Items Damaged/Dirty</div></div>
       </div>
       <div class="report-table-wrap"><table class="report-table">
         <thead><tr><th>Barcode</th><th>Date Reported</th><th>Notes</th></tr></thead>
@@ -1806,7 +2175,7 @@ function renderReport() {
         </tr>`).join('') : '<tr><td colspan="3" style="text-align:center;color:var(--text3);padding:30px">No issues reported.</td></tr>'}</tbody>
       </table></div>`;
 
-  // ---- CINTAS RETURN WORKFLOW ----
+  // ---- CINTAS WORKFLOW ----
   } else if (currentReport === 'cintas-workflow') {
     const barcodes = [...new Set(txns.map(t => t.barcode))];
     const workflowItems = [];
@@ -1815,54 +2184,50 @@ function renderReport() {
       const allTxns = txns.filter(t => t.barcode === bc).sort((a, b) => new Date(a.date) - new Date(b.date));
       if (!allTxns.length) return;
 
-      // Find each step in the workflow
       const distributed = allTxns.find(t => t.action === 'distributed');
       const returned = allTxns.find(t => t.action === 'returned');
+      const collected = allTxns.find(t => t.action === 'collected_from_soil_bin');
       const sentToCintas = allTxns.find(t => t.action === 'sent_to_cintas');
 
-      // Only show if has distributed step or is heading to Cintas
       if (!distributed && !sentToCintas) return;
 
       const emp = distributed ? findEmployeeByIdOrExternal(distributed.employeeId) : null;
+      const { state } = resolveState(bc);
 
-      // Determine workflow status
       let status = '⚠ Incomplete';
       let statusColor = 'var(--orange)';
-      if (distributed && returned && sentToCintas) {
-        status = '✓ Complete';
-        statusColor = 'var(--green)';
-      } else if (distributed && returned) {
-        status = '→ Ready for Cintas';
-        statusColor = 'var(--blue)';
-      } else if (distributed && !returned) {
-        status = '⏳ With Employee';
-        statusColor = 'var(--yellow)';
+      if (distributed && (returned || collected) && sentToCintas) {
+        status = '✓ Complete'; statusColor = 'var(--green)';
+      } else if (distributed && sentToCintas && !returned && !collected) {
+        status = '⚠ At Cintas (Skipped Return)'; statusColor = 'var(--purple)';
+      } else if (distributed && (returned || collected) && !sentToCintas) {
+        status = '→ Ready for Cintas'; statusColor = 'var(--blue)';
+      } else if (distributed && !returned && !collected) {
+        status = '⏳ With Employee'; statusColor = 'var(--yellow)';
       } else if (sentToCintas) {
-        status = '✓ At Cintas';
-        statusColor = 'var(--purple)';
+        status = '✓ At Cintas'; statusColor = 'var(--purple)';
       }
 
+      const hasInferred = allTxns.some(t => t.inferred);
+
       if (!inRange(distributed?.date || sentToCintas?.date || '')) return;
-      if (q && !String(bc).toLowerCase().includes(q) && 
+      if (q && !String(bc).toLowerCase().includes(q) &&
            !(emp?.firstName && String(emp.firstName).toLowerCase().includes(q)) &&
            !(emp?.lastName && String(emp.lastName).toLowerCase().includes(q))) return;
 
       workflowItems.push({
-        barcode: bc,
-        status,
-        statusColor,
+        barcode: bc, status, statusColor,
         distributedDate: distributed?.date || '—',
         distributedEmp: emp ? `${emp.firstName} ${emp.lastName}` : '—',
-        returnedDate: returned?.date || '—',
+        returnedDate: returned?.date || collected?.date || '—',
         sentToCintasDate: sentToCintas?.date || '—',
-        isComplete: !!(distributed && returned && sentToCintas),
-        isReadyForCintas: !!(distributed && returned && !sentToCintas),
-        lastAction: allTxns[allTxns.length - 1]?.action
+        isComplete: !!(distributed && (returned || collected) && sentToCintas),
+        isReadyForCintas: !!(distributed && (returned || collected) && !sentToCintas),
+        hasInferred
       });
     });
 
     workflowItems.sort((a, b) => {
-      // Prioritize incomplete items
       if (a.isComplete !== b.isComplete) return a.isComplete ? 1 : -1;
       if (a.isReadyForCintas !== b.isReadyForCintas) return a.isReadyForCintas ? -1 : 1;
       return a.barcode.localeCompare(b.barcode);
@@ -1874,29 +2239,32 @@ function renderReport() {
 
     container.innerHTML = `
       <div class="report-summary">
-        <div class="rs-card"><div class="rs-num" style="color:var(--green)">${complete}</div><div class="rs-label">Complete Workflow</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--green)">${complete}</div><div class="rs-label">Complete</div></div>
         <div class="rs-card"><div class="rs-num" style="color:var(--blue)">${readyForCintas}</div><div class="rs-label">Ready for Cintas</div></div>
         <div class="rs-card"><div class="rs-num" style="color:var(--orange)">${incomplete}</div><div class="rs-label">Incomplete</div></div>
-        <div class="rs-card"><div class="rs-num" style="color:var(--text2)">${workflowItems.length}</div><div class="rs-label">Total Items</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--text2)">${workflowItems.length}</div><div class="rs-label">Total</div></div>
       </div>
       <div class="report-table-wrap"><table class="report-table" style="font-size:0.9rem">
-        <thead><tr><th>Barcode</th><th>Status</th><th>Distributed (Date / Employee)</th><th>Returned (Date)</th><th>Sent to Cintas (Date)</th></tr></thead>
-        <tbody>${workflowItems.length ? workflowItems.map(item => `<tr style="background:${item.status.includes('✓') ? 'rgba(34,197,94,0.05)' : item.status.includes('→') ? 'rgba(59,130,246,0.05)' : 'rgba(249,115,22,0.05)'}">
+        <thead><tr><th>Barcode</th><th>Status</th><th>Distributed</th><th>Returned</th><th>→ Cintas</th></tr></thead>
+        <tbody>${workflowItems.length ? workflowItems.map(item => `<tr class="${item.hasInferred ? 'inferred-row' : ''}" style="background:${item.status.includes('✓') ? 'rgba(34,197,94,0.05)' : item.status.includes('→') ? 'rgba(59,130,246,0.05)' : 'rgba(249,115,22,0.05)'}">
           <td class="bc-mono"><strong>${escHtml(item.barcode)}</strong></td>
           <td><span class="report-badge" style="background:${item.statusColor}; color:white; padding:4px 8px; border-radius:4px; font-size:0.85rem">${item.status}</span></td>
           <td><small>${formatDate(item.distributedDate)}<br><em style="color:var(--text3)">${escHtml(item.distributedEmp)}</em></small></td>
           <td><small>${item.returnedDate === '—' ? '<em style="color:var(--text3)">Pending...</em>' : formatDate(item.returnedDate)}</small></td>
           <td><small>${item.sentToCintasDate === '—' ? '<em style="color:var(--text3)">Pending...</em>' : formatDate(item.sentToCintasDate)}</small></td>
-        </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:30px">No workflow data found.</td></tr>'}</tbody>
+        </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:30px">No workflow data.</td></tr>'}</tbody>
       </table></div>`;
 
   // ---- BY EMPLOYEE ----
   } else if (currentReport === 'employee-summary') {
     const empList = employees.filter(e => !q || `${e.firstName} ${e.lastName}`.toLowerCase().includes(q) || String(e.employeeId||'').toLowerCase().includes(q));
     const rows = empList.map(e => {
-      const myTxns     = txns.filter(t => t.employeeId === e.id || t.employeeId === e.employeeId);
+      const myTxns = txns.filter(t => t.employeeId === e.id || t.employeeId === e.employeeId);
       const myBarcodes = [...new Set(myTxns.map(t => t.barcode))];
-      const held = myBarcodes.filter(bc => { const l = latestTxn(bc); return l && l.action === 'distributed'; }).length;
+      const held = myBarcodes.filter(bc => {
+        const l = latestByBarcode[bc];
+        return l && l.action === 'distributed' && (l.employeeId === e.id || l.employeeId === e.employeeId);
+      }).length;
       return { e, held, total: myBarcodes.length };
     }).filter(r => r.total > 0 || !q);
 
@@ -1906,23 +2274,21 @@ function renderReport() {
         <div class="rs-card"><div class="rs-num" style="color:var(--orange)">${rows.reduce((a,r)=>a+r.held,0)}</div><div class="rs-label">Currently Out</div></div>
       </div>
       <div class="report-table-wrap"><table class="report-table">
-        <thead><tr><th>Employee</th><th>ID</th><th>Centre</th><th>Currently Holding</th><th>Total Transacted</th></tr></thead>
+        <thead><tr><th>Employee</th><th>ID</th><th>Centre</th><th>Holding</th><th>Total</th></tr></thead>
         <tbody>${rows.length ? rows.map(r => `<tr>
           <td>${escHtml(r.e.firstName)} ${escHtml(r.e.lastName)}</td>
           <td class="bc-mono">${escHtml(r.e.employeeId||'—')}</td>
           <td>${escHtml(r.e.productionCentre||'—')}</td>
           <td><strong style="color:var(--orange)">${r.held}</strong></td>
           <td>${r.total}</td>
-        </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:30px">No data found.</td></tr>'}</tbody>
+        </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:30px">No data.</td></tr>'}</tbody>
       </table></div>`;
 
   // ---- AT CINTAS ----
   } else if (currentReport === 'cintas') {
-    const barcodes = [...new Set(txns.map(t => t.barcode))];
     const rows = [];
-    barcodes.forEach(bc => {
-      const last = latestTxn(bc);
-      if (!last || (last.action !== 'sent_to_cintas' && last.action !== 'reported_issue')) return;
+    Object.entries(latestByBarcode).forEach(([bc, last]) => {
+      if (last.action !== 'sent_to_cintas' && last.action !== 'reported_issue') return;
       if (!inRange(last.date)) return;
       if (q && !String(bc).toLowerCase().includes(q)) return;
       rows.push({ barcode: bc, date: last.date, how: last.action, days: Math.floor((Date.now()-new Date(last.date))/86400000), notes: last.notes||'' });
@@ -1933,44 +2299,42 @@ function renderReport() {
         <div class="rs-card"><div class="rs-num" style="color:var(--yellow)">${rows.filter(r=>r.how==='reported_issue').length}</div><div class="rs-label">Reported Issues</div></div>
       </div>
       <div class="report-table-wrap"><table class="report-table">
-        <thead><tr><th>Barcode</th><th>Reason</th><th>Date</th><th>Days at Cintas</th><th>Notes</th></tr></thead>
+        <thead><tr><th>Barcode</th><th>Reason</th><th>Date</th><th>Days</th><th>Notes</th></tr></thead>
         <tbody>${rows.length ? rows.map(r => `<tr>
           <td class="bc-mono">${escHtml(r.barcode)}</td>
           <td><span class="report-badge ${r.how==='reported_issue'?'issue':'cintas'}">${r.how==='reported_issue'?'Issue/Damaged':'Sent for Cleaning'}</span></td>
           <td>${formatDate(r.date)}</td>
           <td><span style="color:${r.days>14?'var(--red)':'var(--text2)'}">${r.days}d</span></td>
           <td>${escHtml(r.notes)}</td>
-        </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:30px">No uniforms currently at Cintas.</td></tr>'}</tbody>
+        </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:30px">No uniforms at Cintas.</td></tr>'}</tbody>
       </table></div>`;
 
   // ---- WAREHOUSE ----
   } else if (currentReport === 'warehouse') {
-    const barcodes = [...new Set(txns.map(t => t.barcode))];
     const rows = [];
-    barcodes.forEach(bc => {
-      const last = latestTxn(bc);
-      if (!last || (last.action !== 'returned' && last.action !== 'received_from_cintas' && last.action !== 'collected_from_soil_bin' && last.action !== 'collected_from_soil_bin')) return;
+    Object.entries(latestByBarcode).forEach(([bc, last]) => {
+      const state = ACTION_TO_STATE[last.action];
+      if (state !== 'warehouse' && state !== 'soil_bin') return;
       if (!inRange(last.date)) return;
       if (q && !String(bc).toLowerCase().includes(q)) return;
-      const howDisplay = last.action === 'collected_from_soil_bin' ? 'Collected from Soil Bin' : 
-                         last.action === 'returned' ? 'Returned' : 
-                         'Received from Cintas';
+      const howDisplay = last.action === 'collected_from_soil_bin' ? 'Collected from Soil Bin' :
+                         last.action === 'returned' ? 'Returned' : 'Received from Cintas';
       rows.push({ barcode: bc, date: last.date, how: last.action, howDisplay, notes: last.notes||'' });
     });
     container.innerHTML = `
       <div class="report-summary">
         <div class="rs-card"><div class="rs-num" style="color:var(--blue)">${rows.length}</div><div class="rs-label">In Warehouse</div></div>
         <div class="rs-card"><div class="rs-num" style="color:var(--green)">${rows.filter(r=>r.how==='returned').length}</div><div class="rs-label">Employee Returns</div></div>
-        <div class="rs-card"><div class="rs-num">${rows.filter(r=>r.how==='received_from_cintas').length}</div><div class="rs-label">Received from Cintas</div></div>
+        <div class="rs-card"><div class="rs-num">${rows.filter(r=>r.how==='received_from_cintas').length}</div><div class="rs-label">From Cintas</div></div>
       </div>
       <div class="report-table-wrap"><table class="report-table">
-        <thead><tr><th>Barcode</th><th>Date Received</th><th>Source</th><th>Notes</th></tr></thead>
+        <thead><tr><th>Barcode</th><th>Date</th><th>Source</th><th>Notes</th></tr></thead>
         <tbody>${rows.length ? rows.map(r => `<tr>
           <td class="bc-mono">${escHtml(r.barcode)}</td>
           <td>${formatDate(r.date)}</td>
           <td><span class="report-badge ${r.how==='collected_from_soil_bin'?'issue':r.how==='returned'?'returned':'warehouse'}">${r.howDisplay}</span></td>
           <td>${escHtml(r.notes)}</td>
-        </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:30px">No uniforms currently in warehouse.</td></tr>'}</tbody>
+        </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:30px">No uniforms in warehouse.</td></tr>'}</tbody>
       </table></div>`;
 
   // ---- ACTIVITY SUMMARY ----
@@ -1986,25 +2350,13 @@ function renderReport() {
       byCentre: {}
     };
 
-    // Group by action
-    filteredTxns.forEach(t => {
-      stats.byAction[t.action] = (stats.byAction[t.action] || 0) + 1;
-    });
-
-    // Group by date
-    filteredTxns.forEach(t => {
-      const date = t.date;
-      stats.byDate[date] = (stats.byDate[date] || 0) + 1;
-    });
-
-    // Group by employee
+    filteredTxns.forEach(t => { stats.byAction[t.action] = (stats.byAction[t.action] || 0) + 1; });
+    filteredTxns.forEach(t => { stats.byDate[t.date] = (stats.byDate[t.date] || 0) + 1; });
     filteredTxns.filter(t => t.employeeId).forEach(t => {
       const emp = findEmployeeByIdOrExternal(t.employeeId);
       const name = emp ? `${emp.firstName} ${emp.lastName}` : 'Unknown';
       stats.byEmployee[name] = (stats.byEmployee[name] || 0) + 1;
     });
-
-    // Group by centre
     filteredTxns.filter(t => t.employeeId).forEach(t => {
       const emp = findEmployeeByIdOrExternal(t.employeeId);
       const centre = emp?.productionCentre || 'Unknown';
@@ -2014,108 +2366,81 @@ function renderReport() {
     const topEmployees = Object.entries(stats.byEmployee).sort((a,b) => b[1] - a[1]).slice(0, 10);
     const topCentres = Object.entries(stats.byCentre).sort((a,b) => b[1] - a[1]).slice(0, 10);
     const dailyActivity = Object.entries(stats.byDate).sort((a,b) => a[0].localeCompare(b[0]));
+    const inferredCount = filteredTxns.filter(t => t.inferred).length;
 
     container.innerHTML = `
-      <div class="report-summary" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr))">
+      <div class="report-summary" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr))">
         <div class="rs-card"><div class="rs-num" style="color:var(--blue)">${stats.totalScans}</div><div class="rs-label">Total Scans</div></div>
         <div class="rs-card"><div class="rs-num" style="color:var(--green)">${stats.uniqueBarcodes}</div><div class="rs-label">Unique Barcodes</div></div>
         <div class="rs-card"><div class="rs-num" style="color:var(--orange)">${stats.uniqueEmployees}</div><div class="rs-label">Active Employees</div></div>
-        <div class="rs-card"><div class="rs-num" style="color:var(--purple)">${Object.keys(stats.byAction).length}</div><div class="rs-label">Action Types</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--purple)">${inferredCount}</div><div class="rs-label">Auto-Inferred</div></div>
       </div>
-
       <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin:20px 0">
         <div class="card">
           <div class="card-header"><h3 class="card-title">Scans by Action</h3></div>
-          <div class="report-table-wrap" style="max-height:300px">
-            <table class="report-table">
-              <thead><tr><th>Action</th><th>Count</th><th>%</th></tr></thead>
-              <tbody>${Object.entries(stats.byAction).sort((a,b) => b[1] - a[1]).map(([action, count]) => `
-                <tr>
-                  <td><span class="report-badge ${action==='distributed'?'out':action==='returned'?'returned':action==='reported_issue'?'issue':action==='sent_to_cintas'?'cintas':'warehouse'}">${actionLabel(action)}</span></td>
-                  <td>${count}</td>
-                  <td>${((count/stats.totalScans)*100).toFixed(1)}%</td>
-                </tr>
-              `).join('')}</tbody>
-            </table>
-          </div>
+          <div class="report-table-wrap" style="max-height:300px"><table class="report-table">
+            <thead><tr><th>Action</th><th>Count</th><th>%</th></tr></thead>
+            <tbody>${Object.entries(stats.byAction).sort((a,b) => b[1] - a[1]).map(([action, count]) => `
+              <tr>
+                <td><span class="report-badge ${action==='distributed'?'out':action==='returned'?'returned':action==='reported_issue'?'issue':action==='sent_to_cintas'?'cintas':'warehouse'}">${actionLabel(action)}</span></td>
+                <td>${count}</td>
+                <td>${((count/stats.totalScans)*100).toFixed(1)}%</td>
+              </tr>
+            `).join('')}</tbody>
+          </table></div>
         </div>
-
         <div class="card">
           <div class="card-header"><h3 class="card-title">Top Employees</h3></div>
-          <div class="report-table-wrap" style="max-height:300px">
-            <table class="report-table">
-              <thead><tr><th>Employee</th><th>Scans</th></tr></thead>
-              <tbody>${topEmployees.map(([name, count]) => `
-                <tr>
-                  <td>${escHtml(name)}</td>
-                  <td>${count}</td>
-                </tr>
-              `).join('')}</tbody>
-            </table>
-          </div>
+          <div class="report-table-wrap" style="max-height:300px"><table class="report-table">
+            <thead><tr><th>Employee</th><th>Scans</th></tr></thead>
+            <tbody>${topEmployees.map(([name, count]) => `<tr><td>${escHtml(name)}</td><td>${count}</td></tr>`).join('')}</tbody>
+          </table></div>
         </div>
       </div>
-
       <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin:20px 0">
         <div class="card">
           <div class="card-header"><h3 class="card-title">By Production Centre</h3></div>
-          <div class="report-table-wrap" style="max-height:300px">
-            <table class="report-table">
-              <thead><tr><th>Centre</th><th>Scans</th></tr></thead>
-              <tbody>${topCentres.map(([centre, count]) => `
-                <tr>
-                  <td>${escHtml(centre)}</td>
-                  <td>${count}</td>
-                </tr>
-              `).join('')}</tbody>
-            </table>
-          </div>
+          <div class="report-table-wrap" style="max-height:300px"><table class="report-table">
+            <thead><tr><th>Centre</th><th>Scans</th></tr></thead>
+            <tbody>${topCentres.map(([centre, count]) => `<tr><td>${escHtml(centre)}</td><td>${count}</td></tr>`).join('')}</tbody>
+          </table></div>
         </div>
-
         <div class="card">
           <div class="card-header"><h3 class="card-title">Daily Activity</h3></div>
-          <div class="report-table-wrap" style="max-height:300px">
-            <table class="report-table">
-              <thead><tr><th>Date</th><th>Scans</th></tr></thead>
-              <tbody>${dailyActivity.slice(-14).map(([date, count]) => `
-                <tr>
-                  <td>${formatDate(date)}</td>
-                  <td>${count}</td>
-                </tr>
-              `).join('')}</tbody>
-            </table>
-          </div>
+          <div class="report-table-wrap" style="max-height:300px"><table class="report-table">
+            <thead><tr><th>Date</th><th>Scans</th></tr></thead>
+            <tbody>${dailyActivity.slice(-14).map(([date, count]) => `<tr><td>${formatDate(date)}</td><td>${count}</td></tr>`).join('')}</tbody>
+          </table></div>
         </div>
       </div>
     `;
 
-  // ---- BARCODE TIMELINE ----
+  // ---- BARCODE HISTORY ----
   } else if (currentReport === 'barcode-history') {
     let filteredTxns = txns.filter(t => inRange(t.date));
     if (q) filteredTxns = filteredTxns.filter(t => String(t.barcode).toLowerCase().includes(q) || String(t.employeeName||'').toLowerCase().includes(q));
     const canDelete = canDeleteTransactions();
     container.innerHTML = `
       <div class="report-table-wrap"><table class="report-table">
-        <thead><tr><th>Date</th><th>Barcode</th><th>Action</th><th>Employee / Location</th><th>Notes</th>${canDelete ? '<th>Action</th>' : ''}</tr></thead>
-        <tbody>${filteredTxns.length ? filteredTxns.map(t => `<tr>
+        <thead><tr><th>Date</th><th>Barcode</th><th>Action</th><th>Employee / Location</th><th>State</th><th>Notes</th>${canDelete ? '<th>Action</th>' : ''}</tr></thead>
+        <tbody>${filteredTxns.length ? filteredTxns.map(t => {
+          const stateInfo = resolveState(t.barcode);
+          return `<tr class="${t.inferred ? 'inferred-row' : ''}">
           <td>${formatDate(t.date)}</td>
           <td class="bc-mono">${escHtml(t.barcode)}</td>
           <td><span class="report-badge ${t.action==='distributed'?'out':t.action==='returned'?'returned':t.action==='reported_issue'?'issue':t.action==='sent_to_cintas'?'cintas':'warehouse'}">${actionLabel(t.action)}</span></td>
           <td>${escHtml(t.employeeName||(t.action==='reported_issue'?'Issue → Cintas':(t.action||'').includes('cintas')?'Cintas':'Warehouse'))}</td>
-          <td>${escHtml(t.notes||'')}</td>
+          <td><span class="state-badge ${stateInfo.state}">${stateLabel(stateInfo.state)}</span></td>
+          <td>${escHtml(t.notes||'')}${t.inferred ? ' <span class="inferred-indicator">⚙ inferred</span>' : ''}</td>
           ${canDelete ? `<td><button class="btn-text" style="color:var(--red)" onclick="deleteTransaction('${t.id}')">Delete</button></td>` : ''}
-        </tr>`).join('') : '<tr><td colspan="' + (canDelete ? '6' : '5') + '" style="text-align:center;color:var(--text3);padding:30px">No transactions found.</td></tr>'}</tbody>
+        </tr>`;}).join('') : '<tr><td colspan="' + (canDelete ? '7' : '6') + '" style="text-align:center;color:var(--text3);padding:30px">No transactions.</td></tr>'}</tbody>
       </table></div>`;
   }
 }
 
 function deleteTransaction(id) {
-  if (!canDeleteTransactions()) {
-    showToast('Access denied. Your role cannot delete transactions.', 'error');
-    return;
-  }
-  
-  confirm_dialog('Delete Transaction?', 'Are you sure you want to completely remove this barcode scan record from history? This cannot be undone.', () => {
+  if (!canDeleteTransactions()) { showToast('Access denied.', 'error'); return; }
+  confirm_dialog('Delete Transaction?', 'Remove this scan record? This cannot be undone.', () => {
     DB.removeTransaction(id);
     showToast('Transaction deleted.', 'success');
     renderReport();
@@ -2125,7 +2450,7 @@ function deleteTransaction(id) {
 
 function clearDates() {
   document.getElementById('report-from').value = '';
-  document.getElementById('report-to').value   = '';
+  document.getElementById('report-to').value = '';
   renderReport();
 }
 
@@ -2137,270 +2462,651 @@ function exportCSV() {
     showToast('Access denied. Your role cannot export data.', 'error');
     return;
   }
-  
-  const table = document.querySelector('#report-content .report-table');
-  if (!table) { showToast('No data to export.', 'error'); return; }
-  const rows    = [];
-  const headers = [...table.querySelectorAll('thead th')].map(th => th.textContent.trim());
-  rows.push(headers.join(','));
-  table.querySelectorAll('tbody tr').forEach(tr => {
-    const cols = [...tr.querySelectorAll('td')].map(td => `"${td.textContent.trim().replace(/"/g,'""')}"`);
-    rows.push(cols.join(','));
+
+  const txns = DB.transactions;
+  if (!txns.length) { showToast('No data to export.', 'error'); return; }
+
+  const from = document.getElementById('report-from').value;
+  const to   = document.getElementById('report-to').value;
+  let filtered = txns;
+  if (from) filtered = filtered.filter(t => t.date >= from);
+  if (to)   filtered = filtered.filter(t => t.date <= to);
+
+  const headers = ['Date','Barcode','Action','Employee ID','Employee Name','Uniform Type','Notes','State','Inferred','Created At'];
+  const rows = filtered.map(t => {
+    const { state } = resolveState(t.barcode);
+    return [
+      t.date, t.barcode, actionLabel(t.action),
+      t.employeeId || '', t.employeeName || '', t.uniformType || '',
+      t.notes || '', stateLabel(state), t.inferred ? 'Yes' : 'No', t.createdAt
+    ];
   });
-  const blob = new Blob([rows.join('\n')], { type:'text/csv' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a'); a.href = url;
-  a.download = `unitrack_${currentReport}_${today()}.csv`; a.click();
+
+  let csv = headers.join(',') + '\n';
+  rows.forEach(row => {
+    csv += row.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',') + '\n';
+  });
+
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `unitrack_export_${today()}.csv`;
+  a.click();
   URL.revokeObjectURL(url);
-  showToast('CSV exported!', 'success');
+  showToast('✓ CSV exported!', 'success');
 }
 
 // ============================================================
 // SETTINGS
 // ============================================================
 function renderSettings() {
-  renderTags('centre-tags', DB.centres, removeCentre);
-  renderTags('type-tags',   DB.uniformTypes, removeType);
-  // Cloud sync fields
+  // Centres
+  const centreContainer = document.getElementById('centre-tags');
+  centreContainer.innerHTML = DB.centres.map(c =>
+    `<span class="tag">${escHtml(c)}<button onclick="removeCentre('${escHtml(c)}')">✕</button></span>`
+  ).join('');
+  // Types
+  const typeContainer = document.getElementById('type-tags');
+  typeContainer.innerHTML = DB.uniformTypes.map(t =>
+    `<span class="tag">${escHtml(t)}<button onclick="removeType('${escHtml(t)}')">✕</button></span>`
+  ).join('');
+  // Supabase connection
   const urlEl = document.getElementById('cloud-url');
   const keyEl = document.getElementById('cloud-key');
-  if (urlEl && !urlEl.value) urlEl.value = CloudSync.apiUrl;
-  if (keyEl && !keyEl.value) keyEl.value = CloudSync.apiKey;
+  if (urlEl) urlEl.value = CloudSync.apiUrl;
+  if (keyEl) keyEl.value = CloudSync.apiKey;
   updateSyncStatus();
-  
-  if (canManageUsers()) {
-    const uBody = document.getElementById('users-tbody');
-    if (uBody) {
-      if (!DB.users.length) { uBody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text3)">No users found.</td></tr>'; }
-      else {
-        uBody.innerHTML = DB.users.map(u => `<tr>
-          <td><strong>${escHtml(u.username)}</strong></td>
-          <td>${u.role==='admin'?'<span style="color:var(--red);font-weight:600">Admin</span>':u.role==='manager'?'<span style="color:var(--purple);font-weight:600">Manager</span>':u.role==='warehouse'?'<span style="color:var(--green);font-weight:600">Warehouse</span>':'Operator'}</td>
-          <td>${u.password ? '<span style="color:var(--text2);font-size:0.9rem">••••••••</span>' : '<span style="color:var(--text3);font-size:0.9rem">No password</span>'}</td>
-          <td style="text-align:right">
-            <button class="btn-text" onclick="openUserModal('${u.username}')">Edit</button>
-            <button class="btn-text" style="color:var(--red)" onclick="removeUser('${u.username}')">Remove</button>
-          </td>
-        </tr>`).join('');
-      }
-    }
-  }
+
 }
 
-function renderUsers() {
-  if (!canManageUsers()) return;
-  renderSettings(); // Keep settings consistent
-  const userPageBody = document.getElementById('user-page-body');
-  if (!userPageBody) return;
-  const uBody = document.getElementById('users-tbody');
-  if (!uBody) return;
-  if (!DB.users.length) {
-    uBody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text3)">No users found.</td></tr>';
-  } else {
-    uBody.innerHTML = DB.users.map(u => `<tr>
-      <td><strong>${escHtml(u.username)}</strong></td>
-      <td>${u.role==='admin'?'<span style="color:var(--red);font-weight:600">Admin</span>':u.role==='manager'?'<span style="color:var(--purple);font-weight:600">Manager</span>':u.role==='warehouse'?'<span style="color:var(--green);font-weight:600">Warehouse</span>':'Operator'}</td>
-      <td>${u.password ? '<span style="color:var(--text2);font-size:0.9rem">••••••••</span>' : '<span style="color:var(--text3);font-size:0.9rem">No password</span>'}</td>
-      <td style="text-align:right">
-        <button class="btn-text" onclick="openUserModal('${u.username}')">Edit</button>
-        <button class="btn-text" style="color:var(--red)" onclick="removeUser('${u.username}')">Remove</button>
-      </td>
-    </tr>`).join('');
-  }
-}
-
-function openUserModal(username) {
-  if (!canManageUsers()) return;
-  const user = DB.users.find(u => u.username === username);
-  if (!user) return;
-  document.getElementById('user-modal-title').textContent = `Edit user: ${escHtml(user.username)}`;
-  document.getElementById('user-username').value = user.username;
-  document.getElementById('user-password').value = '';
-  document.getElementById('user-role').value = user.role;
-  openModal('user-modal');
-}
-
-function saveUser() {
-  if (!canManageUsers()) return;
-  const username = document.getElementById('user-username').value.trim();
-  const password = document.getElementById('user-password').value;
-  const role     = document.getElementById('user-role').value;
-  if (!username || !role) return showToast('Username and role are required.', 'error');
-
-  const user = DB.users.find(u => u.username === username);
-  if (!user) return showToast('User not found.', 'error');
-  user.role = role;
-  if (password) user.password = password;
-  DB.saveUsers(DB.users);
-  closeModal('user-modal');
-  showToast(`User ${username} updated.`, 'success');
-  renderUsers();
-}
-
-window.openUserModal = openUserModal;
-window.saveUser = saveUser;
-
-function addUser() {
-  console.log("addUser called with currentUser:", currentUser);
-  if (!canManageUsers()) {
-    console.warn("addUser blocked: insufficient privileges or null session.");
-    return;
-  }
-  const u = document.getElementById('new-user-name').value.trim();
-  const p = document.getElementById('new-user-pass').value;
-  const r = document.getElementById('new-user-role').value;
-  if (!u || !p) return showToast('Username and password required.', 'error');
-  if (DB.users.find(x => x.username === u)) return showToast('Username already exists.', 'error');
-  
-  DB.addUser({ username: u, password: p, role: r });
-  showToast(`User ${u} created.`, 'success');
-  document.getElementById('new-user-name').value = '';
-  document.getElementById('new-user-pass').value = '';
+function addCentre() {
+  const input = document.getElementById('new-centre');
+  const val = input.value.trim();
+  if (!val) return;
+  if (DB.centres.includes(val)) { showToast('Already exists.', 'error'); return; }
+  DB.saveCentres([...DB.centres, val]);
+  input.value = '';
   renderSettings();
 }
-window.addUser = addUser;
 
-function removeUser(u) {
-  if (!canManageUsers()) return;
-  if (u === currentUser.username) return showToast('Cannot delete yourself!', 'error');
-  if (u === 'admin') return showToast('Cannot delete master admin account!', 'error');
-  confirm_dialog('Remove user?', `Are you sure you want to remove access for user ${u}?`, () => {
-    DB.saveUsers(DB.users.filter(x => x.username !== u));
-    showToast(`User ${u} removed.`, 'success');
-    renderSettings();
-  });
+function removeCentre(name) {
+  DB.saveCentres(DB.centres.filter(c => c !== name));
+  renderSettings();
 }
-window.removeUser = removeUser;
-function renderTags(id, items, removeFn) {
-  const el = document.getElementById(id);
-  if (!items.length) { el.innerHTML = '<span style="color:var(--text3);font-size:0.8rem">No items.</span>'; return; }
-  el.innerHTML = items.map(item => `<span class="tag">${escHtml(item)}<button onclick="${removeFn.name}('${escHtml(item)}')">✕</button></span>`).join('');
-}
-function addCentre() {
-  const val = document.getElementById('new-centre').value.trim();
-  if (!val) return;
-  const list = DB.centres;
-  if (list.includes(val)) { showToast('Already exists.', 'error'); return; }
-  list.push(val); DB.saveCentres(list);
-  document.getElementById('new-centre').value = '';
-  renderSettings(); showToast('Centre added!', 'success');
-}
-function removeCentre(name) { DB.saveCentres(DB.centres.filter(c => c !== name)); renderSettings(); }
+
 function addUniformType() {
-  const val = document.getElementById('new-type').value.trim();
+  const input = document.getElementById('new-type');
+  const val = input.value.trim();
   if (!val) return;
-  const list = DB.uniformTypes;
-  if (list.includes(val)) { showToast('Already exists.', 'error'); return; }
-  list.push(val); DB.saveTypes(list);
-  document.getElementById('new-type').value = '';
-  renderSettings(); showToast('Type added!', 'success');
+  if (DB.uniformTypes.includes(val)) { showToast('Already exists.', 'error'); return; }
+  DB.saveTypes([...DB.uniformTypes, val]);
+  input.value = '';
+  renderSettings();
 }
-function removeType(name) { DB.saveTypes(DB.uniformTypes.filter(t => t !== name)); renderSettings(); }
 
-// ============================================================
-// JSON BACKUP
-// ============================================================
-function exportJSON() {
-  const data = { version:1, exported:new Date().toISOString(), employees:DB.employees, transactions:DB.transactions, centres:DB.centres, uniformTypes:DB.uniformTypes };
-  const blob = new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a'); a.href = url;
-  a.download = `unitrack_backup_${today()}.json`; a.click();
-  URL.revokeObjectURL(url);
-  showToast('Backup exported!', 'success');
+function removeType(name) {
+  DB.saveTypes(DB.uniformTypes.filter(t => t !== name));
+  renderSettings();
 }
+
+function exportJSON() {
+  const data = {
+    employees: DB.employees,
+    transactions: DB.transactions,
+    centres: DB.centres,
+    uniformTypes: DB.uniformTypes,
+    exportDate: new Date().toISOString(),
+    version: 'v3'
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `unitrack_backup_${today()}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('✓ Backup exported!', 'success');
+}
+
 function importJSON(event) {
-  const file = event.target.files[0]; if (!file) return;
+  if (!canManageEmployees()) { showToast('Access denied.', 'error'); return; }
+  const file = event.target.files[0];
+  if (!file) return;
   const reader = new FileReader();
-  reader.onload = (e) => {
+  reader.onload = async (e) => {
     try {
       const data = JSON.parse(e.target.result);
-      console.log('Import data parsed:', data);
-      console.log('Employees in import:', data.employees);
-      console.log('Transactions in import:', data.transactions);
-      confirm_dialog('Import Backup?','This will REPLACE all current data. Are you sure?', async () => {
-        // Temporarily disable auto-sync to prevent conflicts during import
-        stopAutoSync();
-        
-        try {
-          if (data.employees) {
-            console.log('Saving employees:', data.employees);
-            DB.saveEmployees(data.employees);
-          }
-          if (data.centres)      DB.saveCentres(data.centres);
-          if (data.uniformTypes) DB.saveTypes(data.uniformTypes);
-          
-          if (data.transactions) {
-            console.log('Clearing transactions and saving:', data.transactions.length, 'transactions');
-            await IDB.clearTransactions();
-            
-            // Ensure each transaction has a unique ID
-            const txnsWithIds = data.transactions.map(t => ({
-              ...t,
-              id: t.id || uid()
-            }));
-            
-            DB_MEMORY.transactions = txnsWithIds;
-            for (const t of txnsWithIds) {
-              try {
-                await IDB.saveTransaction(t);
-              } catch (err) {
-                console.error('Failed saving transaction during import:', err, 'Transaction:', t);
-              }
-            }
-            console.log('Import complete:', DB_MEMORY.transactions.length, 'transactions saved');
-          }
-          
-          showToast('Backup imported!', 'success');
-          renderSettings(); renderDashboard();
-        } finally {
-          // Resume auto-sync after import is complete
-          startAutoSync();
-        }
-      });
-    } catch (parseError) {
-      console.error('JSON parse error:', parseError);
-      showToast('Invalid backup file.', 'error');
+      if (data.employees) DB.saveEmployees(data.employees);
+      if (data.transactions) {
+        DB_MEMORY.transactions = data.transactions;
+        await IDB.saveTransactionsBulk(data.transactions);
+      }
+      if (data.centres) DB.saveCentres(data.centres);
+      if (data.uniformTypes) DB.saveTypes(data.uniformTypes);
+      showToast('✓ Data imported!', 'success');
+      renderDashboard(); renderEmployeeList(); renderSettings();
+    } catch (err) {
+      showToast('Import failed: ' + err.message, 'error');
     }
   };
   reader.readAsText(file);
   event.target.value = '';
 }
-function clearAllData() {
-  confirm_dialog('Clear ALL Data?','Permanently delete all employees, transactions, and settings. This CANNOT be undone!', async () => {
-    // Clear IndexedDB
-    const stores = ['store','transactions'];
-    for (const s of stores) {
-      const tx = IDB.db.transaction(s, 'readwrite');
-      tx.objectStore(s).clear();
+
+// ============================================================
+// USERS PAGE (NEW - complete implementation)
+// ============================================================
+function renderUsers() {
+  if (!canManageUsers()) {
+    const tbody = document.getElementById('users-tbody');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:30px;color:var(--text3)">Access denied. Admin only.</td></tr>';
+    return;
+  }
+  const q = (document.getElementById('user-search')?.value || '').toLowerCase();
+  const tbody = document.getElementById('users-tbody');
+  if (!tbody) return;
+
+  const users = DB.users.filter(u => !q || u.username.toLowerCase().includes(q) || u.role.toLowerCase().includes(q));
+
+  tbody.innerHTML = users.length ? users.map((u, idx) => `<tr>
+    <td><strong>${escHtml(u.username)}</strong></td>
+    <td><span class="role-badge ${u.role}">${u.role.charAt(0).toUpperCase() + u.role.slice(1)}</span></td>
+    <td>
+      <button class="btn-text" onclick="openUserModal(${idx})" style="margin-right:8px">Edit</button>
+      <button class="btn-text" style="color:var(--red)" onclick="deleteUser(${idx})">Delete</button>
+    </td>
+  </tr>`).join('') : '<tr><td colspan="3" style="text-align:center;padding:30px;color:var(--text3)">No users found.</td></tr>';
+}
+
+function openUserModal(idx) {
+  if (!canManageUsers()) { showToast('Access denied.', 'error'); return; }
+  const isEdit = idx !== undefined && idx !== null;
+  document.getElementById('user-modal-title').textContent = isEdit ? 'Edit User' : 'Add User';
+  document.getElementById('user-edit-idx').value = isEdit ? idx : '';
+
+  if (isEdit) {
+    const u = DB.users[idx];
+    document.getElementById('user-username').value = u.username;
+    document.getElementById('user-password').value = u.password;
+    document.getElementById('user-role').value = u.role;
+  } else {
+    document.getElementById('user-username').value = '';
+    document.getElementById('user-password').value = '';
+    document.getElementById('user-role').value = 'operator';
+  }
+  openModal('user-modal');
+}
+
+function saveUser() {
+  if (!canManageUsers()) { showToast('Access denied.', 'error'); return; }
+  const username = document.getElementById('user-username').value.trim();
+  const password = document.getElementById('user-password').value.trim();
+  const role     = document.getElementById('user-role').value;
+  if (!username || !password) { showToast('Username and password required.', 'error'); return; }
+
+  const idx = document.getElementById('user-edit-idx').value;
+  const list = DB.users;
+
+  if (idx !== '') {
+    // Edit
+    list[parseInt(idx)] = { username, password, role };
+  } else {
+    // Check duplicate
+    if (list.some(u => u.username.toLowerCase() === username.toLowerCase())) {
+      showToast('Username already exists.', 'error'); return;
     }
-    // Clear memory
+    list.push({ username, password, role });
+  }
+  DB.saveUsers(list);
+  closeModal('user-modal');
+  showToast(`User ${username} saved!`, 'success');
+  renderUsers();
+}
+
+function deleteUser(idx) {
+  if (!canManageUsers()) { showToast('Access denied.', 'error'); return; }
+  const user = DB.users[idx];
+  if (!user) return;
+  if (user.username === currentUser?.username) {
+    showToast('Cannot delete the currently logged-in user.', 'error'); return;
+  }
+  confirm_dialog(`Delete user "${user.username}"?`, 'This cannot be undone.', () => {
+    const list = DB.users;
+    list.splice(idx, 1);
+    DB.saveUsers(list);
+    showToast('User deleted.', 'success');
+    renderUsers();
+  });
+}
+
+// ============================================================
+// DANGER ZONE
+// ============================================================
+// ============================================================
+// SMART DATABASE CLEANUP ENGINE
+// ============================================================
+
+// What intermediate steps are needed to go from state → new action
+const INFERENCE_STEPS_NEEDED = {
+  'with_employee': {
+    'collected_from_soil_bin': ['returned'],
+    'sent_to_cintas':          ['returned', 'collected_from_soil_bin'],
+    'received_from_cintas':    ['returned', 'collected_from_soil_bin', 'sent_to_cintas'],
+    'distributed':             ['returned'],   // re-distribute to another employee
+    'reported_issue':          []              // valid direct
+  },
+  'warehouse': {
+    'received_from_cintas':    ['collected_from_soil_bin', 'sent_to_cintas']
+  },
+  'soil_bin': {
+    'received_from_cintas':    ['sent_to_cintas']
+  },
+  'at_cintas': {
+    'distributed':             ['received_from_cintas'],
+    'reported_issue':          ['received_from_cintas']
+  },
+  'damaged': {
+    'received_from_cintas':    ['sent_to_cintas'],
+    'distributed':             ['sent_to_cintas', 'received_from_cintas']
+  }
+};
+
+// Replay state machine for one barcode's sorted history.
+// Returns { finalState, stepsToInject[] }
+function replayBarcodeHistory(sortedTxns) {
+  const ACTION_TO_ST = {
+    received_from_cintas:    'warehouse',
+    distributed:             'with_employee',
+    returned:                'warehouse',
+    collected_from_soil_bin: 'soil_bin',
+    sent_to_cintas:          'at_cintas',
+    reported_issue:          'damaged'
+  };
+
+  let state = 'unknown';
+  let lastTxn = null;
+  const stepsToInject = [];
+
+  for (const txn of sortedTxns) {
+    if (txn.inferred) {
+      // Already an inferred step — update state and continue
+      state = ACTION_TO_ST[txn.action] || state;
+      lastTxn = txn;
+      continue;
+    }
+
+    const neededMap = INFERENCE_STEPS_NEEDED[state] || {};
+    const needed    = neededMap[txn.action] || [];
+
+    if (needed.length > 0) {
+      // Calculate estimated date between last txn and this txn
+      const prevDate = lastTxn ? lastTxn.date : txn.date;
+      const midDate  = estimateMidDate(prevDate, txn.date);
+
+      for (const missingAction of needed) {
+        const inferredTxn = {
+          id:           uid(),
+          barcode:      txn.barcode,
+          action:       missingAction,
+          date:         midDate,
+          createdAt:    new Date(midDate + 'T12:00:00Z').toISOString(),
+          employeeId:   missingAction === 'returned' ? (lastTxn?.employeeId || null) : null,
+          employeeName: missingAction === 'returned' ? (lastTxn?.employeeName || null) : null,
+          uniformType:  txn.uniformType || lastTxn?.uniformType || '',
+          notes:        'Auto-corrected by Smart Cleanup',
+          inferred:     true
+        };
+        stepsToInject.push(inferredTxn);
+        state = ACTION_TO_ST[missingAction] || state;
+        lastTxn = inferredTxn;
+      }
+    }
+
+    state   = ACTION_TO_ST[txn.action] || state;
+    lastTxn = txn;
+  }
+
+  return { finalState: state, stepsToInject };
+}
+
+async function runSmartCleanup() {
+  if (!canManageUsers()) { showToast('Access denied — Admin only.', 'error'); return; }
+
+  const btn = document.getElementById('smart-cleanup-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Analysing…'; }
+
+  showToast('Analysing database…', 'info');
+
+  try {
+    // ── PHASE 1: Pull latest from Supabase first ────────────────
+    const sb = getSupabase();
+    if (sb) {
+      try { await CloudSync.pullAll(true); } catch(_) {}
+    }
+
+    const allTxns = [...DB_MEMORY.transactions];
+
+    // ── PHASE 2: Deduplicate ────────────────────────────────────
+    // Sort oldest → newest so we keep the first occurrence
+    const sorted = [...allTxns].sort((a, b) => {
+      const dateComp = (a.date || '').localeCompare(b.date || '');
+      if (dateComp !== 0) return dateComp;
+      return new Date(a.createdAt) - new Date(b.createdAt);
+    });
+
+    const seenKeys = new Set();
+    const seenIds  = new Set();
+    const deduped  = [];
+    const removedDupes = [];
+
+    for (const t of sorted) {
+      const key = `${t.barcode}|${t.action}|${t.date}|${t.employeeId || ''}`;
+      if (seenKeys.has(key) || seenIds.has(t.id)) {
+        removedDupes.push(t);
+      } else {
+        seenKeys.add(key);
+        seenIds.add(t.id);
+        deduped.push(t);
+      }
+    }
+
+    // ── PHASE 3: Retroactive inference per barcode ──────────────
+    const barcodeGroups = {};
+    for (const t of deduped) {
+      if (!barcodeGroups[t.barcode]) barcodeGroups[t.barcode] = [];
+      barcodeGroups[t.barcode].push(t);
+    }
+
+    // Sort each barcode's history chronologically
+    for (const bc of Object.keys(barcodeGroups)) {
+      barcodeGroups[bc].sort((a, b) => {
+        const dc = (a.date || '').localeCompare(b.date || '');
+        return dc !== 0 ? dc : new Date(a.createdAt) - new Date(b.createdAt);
+      });
+    }
+
+    const allInjected = [];
+    const affectedBarcodes = [];
+
+    for (const [barcode, txns] of Object.entries(barcodeGroups)) {
+      // Skip barcodes where ALL steps are already inferred (no real data)
+      const realTxns = txns.filter(t => !t.inferred);
+      if (realTxns.length === 0) continue;
+
+      const { stepsToInject } = replayBarcodeHistory(txns);
+
+      if (stepsToInject.length > 0) {
+        allInjected.push(...stepsToInject);
+        affectedBarcodes.push({
+          barcode,
+          injected: stepsToInject.map(t => t.action),
+          lastRealDate: realTxns[realTxns.length - 1].date
+        });
+      }
+    }
+
+    // ── PHASE 4: Build final clean dataset ──────────────────────
+    const finalTxns = [...deduped, ...allInjected].sort((a, b) => {
+      const dc = (a.date || '').localeCompare(b.date || '');
+      return dc !== 0 ? dc : new Date(a.createdAt) - new Date(b.createdAt);
+    });
+
+    // ── PHASE 5: Show preview modal ─────────────────────────────
+    showCleanupPreview({
+      original:          allTxns.length,
+      afterDedup:        deduped.length,
+      removedDupes:      removedDupes.length,
+      injected:          allInjected.length,
+      affectedBarcodes,
+      finalTxns
+    });
+
+  } catch (e) {
+    showToast('Cleanup analysis failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🧹 Smart Cleanup'; }
+  }
+}
+
+function showCleanupPreview({ original, afterDedup, removedDupes, injected, affectedBarcodes, finalTxns }) {
+  const ACTION_LABELS = {
+    received_from_cintas:    '📦 Received from Cintas',
+    distributed:             '👕 Distributed to Employee',
+    returned:                '↩ Returned from Employee',
+    collected_from_soil_bin: '🧺 Collected from Soil Bin',
+    sent_to_cintas:          '🚚 Sent to Cintas',
+    reported_issue:          '⚠ Reported Issue'
+  };
+
+  // Build affected barcodes list (show max 10)
+  const MAX_SHOW = 10;
+  const shown = affectedBarcodes.slice(0, MAX_SHOW);
+  const more  = affectedBarcodes.length - MAX_SHOW;
+
+  let barcodeRows = shown.map(b => `
+    <tr>
+      <td style="font-family:monospace;font-size:0.85rem">${escHtml(b.barcode)}</td>
+      <td style="font-size:0.8rem;color:var(--text2)">${b.injected.map(a => ACTION_LABELS[a] || a).join(' → ')}</td>
+    </tr>`).join('');
+
+  if (more > 0) {
+    barcodeRows += `<tr><td colspan="2" style="color:var(--text3);font-style:italic;font-size:0.8rem">…and ${more} more barcodes</td></tr>`;
+  }
+
+  const noChanges = removedDupes === 0 && injected === 0;
+
+  const body = `
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:20px">
+      <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:10px;padding:12px;text-align:center">
+        <div style="font-size:1.8rem;font-weight:700;color:#ef4444">${removedDupes}</div>
+        <div style="font-size:0.78rem;color:var(--text2)">Duplicate Transactions<br>to Remove</div>
+      </div>
+      <div style="background:rgba(139,92,246,0.08);border:1px solid rgba(139,92,246,0.2);border-radius:10px;padding:12px;text-align:center">
+        <div style="font-size:1.8rem;font-weight:700;color:#8b5cf6">${injected}</div>
+        <div style="font-size:0.78rem;color:var(--text2)">Missing Steps<br>to Auto-Inject</div>
+      </div>
+      <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:10px;padding:12px;text-align:center">
+        <div style="font-size:1.8rem;font-weight:700;color:#10b981">${finalTxns.length}</div>
+        <div style="font-size:0.78rem;color:var(--text2)">Clean Transactions<br>After Fix</div>
+      </div>
+    </div>
+
+    ${noChanges ? `
+      <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:10px;padding:16px;text-align:center;color:#059669">
+        ✅ Database is already clean! No duplicates or missing steps found.
+      </div>
+    ` : ''}
+
+    ${injected > 0 ? `
+      <div style="margin-bottom:16px">
+        <p style="font-size:0.84rem;color:var(--text2);margin-bottom:8px">
+          <strong>${affectedBarcodes.length} barcodes</strong> need missing workflow steps injected (e.g. items still on hold with employee but were later returned to Cintas):
+        </p>
+        <div style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:8px">
+          <table style="width:100%;border-collapse:collapse;font-size:0.82rem">
+            <thead style="position:sticky;top:0;background:var(--surface2)">
+              <tr><th style="padding:8px 12px;text-align:left">Barcode</th><th style="padding:8px 12px;text-align:left">Steps to Inject</th></tr>
+            </thead>
+            <tbody>${barcodeRows}</tbody>
+          </table>
+        </div>
+      </div>
+    ` : ''}
+
+    ${removedDupes > 0 ? `
+      <div style="background:rgba(245,158,11,0.06);border:1px solid rgba(245,158,11,0.15);border-radius:8px;padding:10px 14px;font-size:0.82rem;color:var(--text2)">
+        ⚠ <strong>${removedDupes} duplicate transactions</strong> will be permanently removed from Supabase.
+      </div>
+    ` : ''}
+
+    ${!noChanges ? `
+      <p style="font-size:0.8rem;color:var(--text3);margin-top:12px">
+        This will update Supabase directly. The cleanup cannot be undone — export a backup first if needed.
+      </p>
+    ` : ''}
+  `;
+
+  if (noChanges) {
+    confirm_dialog('✅ Database Analysis Complete', body, null, { hideConfirm: true, cancelLabel: 'Close' });
+    return;
+  }
+
+  confirm_dialog(
+    '🧹 Smart Cleanup Preview',
+    body,
+    () => applySmartCleanup(finalTxns)
+  );
+}
+
+async function applySmartCleanup(finalTxns) {
+  const btn = document.getElementById('smart-cleanup-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
+
+  showToast('Applying cleanup — please wait…', 'info');
+
+  try {
+    const sb = getSupabase();
+
+    if (sb) {
+      // Delete ALL existing transactions from Supabase, then re-insert clean set
+      // We do this in a replace strategy: delete by barcode batches
+      const barcodes = [...new Set(finalTxns.map(t => t.barcode))];
+
+      // Delete old transactions for all affected barcodes
+      for (let i = 0; i < barcodes.length; i += 100) {
+        const batch = barcodes.slice(i, i + 100);
+        const { error } = await sb.from('transactions').delete().in('barcode', batch);
+        if (error) throw new Error('Delete failed: ' + error.message);
+      }
+
+      // Re-insert the clean transactions
+      const rows = finalTxns.map(txnToSupabase);
+      for (let i = 0; i < rows.length; i += 500) {
+        const { error } = await sb.from('transactions')
+          .insert(rows.slice(i, i + 500));
+        if (error) throw new Error('Re-insert failed: ' + error.message);
+      }
+    }
+
+    // Update local memory + IndexedDB
+    DB_MEMORY.transactions = finalTxns.sort((a, b) =>
+      new Date(b.createdAt) - new Date(a.createdAt));
+    await IDB.saveTransactionsBulk(DB_MEMORY.transactions);
+
+    localStorage.setItem('ut_last_sync', new Date().toISOString());
+    showToast(`✅ Cleanup done! ${finalTxns.length} clean transactions saved to Supabase.`, 'success');
+    renderDashboard();
+    renderEmployeeList();
+
+  } catch (e) {
+    showToast('Cleanup failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🧹 Smart Cleanup'; }
+  }
+}
+
+window.runSmartCleanup = runSmartCleanup;
+
+
+function clearAllData() {
+  if (!canManageUsers()) { showToast('Access denied.', 'error'); return; }
+  confirm_dialog('⚠ Clear ALL Data?', 'This will permanently delete all employees, transactions, and settings. This CANNOT be undone!', () => {
     DB_MEMORY.employees = [];
     DB_MEMORY.transactions = [];
-    // Users are NOT cleared to prevent lockout, 
-    // but settings (centres/types) are reset to defaults
     DB_MEMORY.centres = ["Main Plant","Warehouse A","Warehouse B","Office"];
     DB_MEMORY.uniformTypes = ["Shirt","Pants","Jacket","Safety Vest","Cap","Gloves"];
-    
-    // Also clear localStorage if anything remained
-    localStorage.clear();
-    
+    IDB.set('ut_employees', []);
+    IDB.clearTransactions();
+    IDB.set('ut_centres', DB_MEMORY.centres);
+    IDB.set('ut_types', DB_MEMORY.uniformTypes);
     showToast('All data cleared.', 'success');
     renderDashboard(); renderEmployeeList(); renderSettings();
   });
 }
 
 // ============================================================
+// MODALS & TOAST
+// ============================================================
+function openModal(id) {
+  const el = document.getElementById(id);
+  if (el) {
+    el.style.display = 'flex';
+    setTimeout(() => {
+      el.classList.add('open');
+    }, 10);
+  }
+}
+
+function closeModal(id) {
+  const el = document.getElementById(id);
+  if (el) {
+    el.classList.remove('open');
+    setTimeout(() => {
+      if (!el.classList.contains('open')) el.style.display = 'none';
+    }, 300);
+  }
+}
+
+function closeModalIfBg(event, id) {
+  if (event.target === event.currentTarget) closeModal(id);
+}
+
+function showToast(msg, type = 'info') {
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.className = 'toast ' + type + ' show';
+  clearTimeout(toast._timeout);
+  toast._timeout = setTimeout(() => { toast.classList.remove('show'); }, 3500);
+}
+
+function confirm_dialog(title, message, onOk, optsOrBool = false) {
+  // Backwards compat: 4th arg can be boolean (legacy) or options object
+  const opts = (typeof optsOrBool === 'object' && optsOrBool !== null) ? optsOrBool : { useInnerHTML: optsOrBool };
+  const useInnerHTML  = opts.useInnerHTML  || false;
+  const hideConfirm   = opts.hideConfirm   || false;
+  const cancelLabel   = opts.cancelLabel   || 'Cancel';
+  const confirmLabel  = opts.confirmLabel  || 'Confirm';
+
+  const overlay = document.getElementById('confirm-overlay');
+  document.getElementById('confirm-title').textContent = title;
+  const msgEl = document.getElementById('confirm-message');
+  if (useInnerHTML || typeof message === 'string' && message.includes('<')) {
+    msgEl.innerHTML = message;
+  } else {
+    msgEl.textContent = message;
+  }
+  openModal('confirm-overlay');
+
+  const okBtn = document.getElementById('confirm-ok');
+  const cancelBtn = document.getElementById('confirm-cancel');
+  const newOk = okBtn.cloneNode(true);
+  const newCancel = cancelBtn.cloneNode(true);
+  okBtn.parentNode.replaceChild(newOk, okBtn);
+  cancelBtn.parentNode.replaceChild(newCancel, cancelBtn);
+
+  newOk.textContent  = confirmLabel;
+  newOk.style.display = hideConfirm ? 'none' : '';
+  newCancel.textContent = cancelLabel;
+
+  if (!hideConfirm && onOk) {
+    newOk.addEventListener('click', () => { closeModal('confirm-overlay'); onOk(); });
+  }
+  newCancel.addEventListener('click', () => { closeModal('confirm-overlay'); });
+}
+
+
+// ============================================================
 // EXCEL / CSV IMPORT
 // ============================================================
 const FIELD_ALIASES = {
-  firstName:        ['first name','firstname','first','given name','prénom','prenom','name','full name','employee name'],
-  lastName:         ['last name','lastname','last','surname','family name','nom'],
-  employeeId:       ['employee id','emp id','id','badge','badge number','badge no','employee no','emp no'],
-  productionCentre: ['production centre','production center','centre','center','plant','site','location'],
-  department:       ['department','dept','division','team'],
-  phone:            ['phone','telephone','tel','mobile','cell'],
-  notes:            ['notes','remarks','comments','note']
+  firstName:        ['first name','first_name','firstname','given name','fname','prenom'],
+  lastName:         ['last name','last_name','lastname','surname','family name','lname'],
+  employeeId:       ['employee id','employee_id','emp id','emp_id','id number','id_number','badge','badge id','badge_id','employeeid'],
+  productionCentre: ['production centre','production_centre','centre','center','plant','location','site','production center'],
+  department:       ['department','dept','dept.','division','section','area'],
+  phone:            ['phone','phone number','phone_number','tel','telephone','mobile','cell','contact'],
+  notes:            ['notes','note','comments','comment','remarks','memo','description']
 };
 
 function openExcelImport() {
@@ -2408,243 +3114,209 @@ function openExcelImport() {
   document.getElementById('xl-step1').style.display = 'block';
   document.getElementById('xl-step2').style.display = 'none';
   document.getElementById('xl-step3').style.display = 'none';
-  document.getElementById('xl-next-btn').style.display   = 'none';
+  document.getElementById('xl-next-btn').style.display = 'none';
   document.getElementById('xl-import-btn').style.display = 'none';
-  document.getElementById('xl-file-input').value = '';
+  const dropzone = document.getElementById('xl-dropzone');
+  if (dropzone) {
+    dropzone.classList.remove('has-file');
+    const sub = dropzone.querySelector('.xl-drop-text');
+    if (sub) sub.textContent = 'Click to browse or drag & drop your file here';
+  }
   openModal('excel-import-modal');
 }
 
 function handleExcelFile(event) {
   const file = event.target.files[0];
   if (!file) return;
-  const ext = file.name.split('.').pop().toLowerCase();
   const reader = new FileReader();
-
   reader.onload = (e) => {
     try {
-      let rows = [];
-      if (ext === 'csv') {
-        const text = e.target.result;
-        rows = parseCSV(text);
-      } else {
-        const workbook = XLSX.read(e.target.result, { type: 'array' });
-        const sheet    = workbook.Sheets[workbook.SheetNames[0]];
-        rows           = XLSX.utils.sheet_to_json(sheet, { header:1, defval:'' });
-      }
-
-      if (rows.length < 2) { showToast('File appears to be empty.', 'error'); return; }
-
-      xlHeaders = rows[0].map(h => String(h).trim());
-      xlRawRows = rows.slice(1).filter(r => r.some(cell => String(cell).trim()));
+      const workbook = XLSX.read(e.target.result, { type: 'array' });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const json = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+      if (json.length < 2) { showToast('File has no data rows.', 'error'); return; }
+      xlHeaders = json[0].map(h => String(h || '').trim());
+      xlRawRows = json.slice(1).filter(r => r.some(c => c !== undefined && c !== null && c !== ''));
 
       // Auto-detect column mapping
       xlMapping = {};
-      xlHeaders.forEach((h, idx) => {
-        const hl = h.toLowerCase();
-        for (const [field, aliases] of Object.entries(FIELD_ALIASES)) {
-          if (!xlMapping[field] && aliases.some(a => hl.includes(a))) {
-            xlMapping[field] = idx;
-          }
-        }
+      Object.entries(FIELD_ALIASES).forEach(([field, aliases]) => {
+        const match = xlHeaders.findIndex(h =>
+          aliases.some(a => h.toLowerCase().includes(a))
+        );
+        if (match >= 0) xlMapping[field] = match;
       });
 
-      document.getElementById('xl-file-info').innerHTML = `
-        <div class="xl-tip" style="background:rgba(63,185,80,0.08);border-color:rgba(63,185,80,0.3)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-          <div><strong>${file.name}</strong> — ${xlRawRows.length} rows detected &middot; ${xlHeaders.length} columns</div>
-        </div>`;
+      // Check for single "Name" or "Full Name" column
+      if (xlMapping.firstName === undefined && xlMapping.lastName === undefined) {
+        const nameIdx = xlHeaders.findIndex(h => /^(name|full\s*name|employee\s*name)$/i.test(h.trim()));
+        if (nameIdx >= 0) { xlMapping.firstName = nameIdx; xlMapping._singleName = true; }
+      }
 
-      renderMappingGrid();
-      document.getElementById('xl-step1').style.display = 'none';
-      document.getElementById('xl-step2').style.display = 'block';
-      document.getElementById('xl-next-btn').style.display = 'inline-flex';
-      showToast('File loaded. Review the column mapping below.', 'success');
+      showStep2();
     } catch (err) {
-      showToast('Could not read file: ' + err.message, 'error');
+      showToast('Error reading file: ' + err.message, 'error');
     }
   };
-
-  if (ext === 'csv') reader.readAsText(file);
-  else               reader.readAsArrayBuffer(file);
+  reader.readAsArrayBuffer(file);
 }
 
-function parseCSV(text) {
-  return text.split('\n').map(line => {
-    const row = []; let cur = ''; let inQ = false;
-    for (let i = 0; i < line.length; i++) {
-      const c = line[i];
-      if (c === '"') { inQ = !inQ; }
-      else if (c === ',' && !inQ) { row.push(cur.trim()); cur = ''; }
-      else { cur += c; }
-    }
-    row.push(cur.trim());
-    return row;
-  }).filter(r => r.length > 0 && r.some(c => c));
-}
+function showStep2() {
+  document.getElementById('xl-step1').style.display = 'none';
+  document.getElementById('xl-step2').style.display = 'block';
+  document.getElementById('xl-next-btn').style.display = 'inline-flex';
+  document.getElementById('xl-file-info').innerHTML = `<strong>${xlRawRows.length}</strong> rows detected, <strong>${xlHeaders.length}</strong> columns`;
 
-function renderMappingGrid() {
+  const grid = document.getElementById('xl-mapping-grid');
   const fields = [
-    { key:'firstName',        label:'First Name', required:true  },
-    { key:'lastName',         label:'Last Name',  required:true  },
-    { key:'employeeId',       label:'Employee ID',required:false },
-    { key:'productionCentre', label:'Production Centre', required:false },
-    { key:'department',       label:'Department', required:false },
-    { key:'phone',            label:'Phone',      required:false },
-    { key:'notes',            label:'Notes',      required:false }
+    { key: 'firstName', label: 'First Name', required: true },
+    { key: 'lastName', label: 'Last Name', required: !xlMapping._singleName },
+    { key: 'employeeId', label: 'Employee ID' },
+    { key: 'productionCentre', label: 'Production Centre' },
+    { key: 'department', label: 'Department' },
+    { key: 'phone', label: 'Phone' },
+    { key: 'notes', label: 'Notes' }
   ];
-  const options = ['(skip)', ...xlHeaders].map((h, i) =>
-    `<option value="${i-1}" ${xlMapping[fields[0]?.key] === i-1 ? '' : ''}>${i === 0 ? '— Skip this field —' : `[Col ${i}] ${h}`}</option>`
-  );
 
-  document.getElementById('xl-mapping-grid').innerHTML = fields.map(f => {
-    const sel = ['<option value="-1">— Skip this field —</option>',
-      ...xlHeaders.map((h, idx) => `<option value="${idx}" ${xlMapping[f.key] === idx ? 'selected' : ''}>[Col ${idx+1}] ${h}</option>`)
-    ].join('');
-    return `<div class="xl-map-row">
-      <div class="xl-map-label">${f.label}${f.required ? ' <span style="color:var(--red)">*</span>' : ''}</div>
-      <select class="field-input xl-map-select" id="xlmap-${f.key}" onchange="xlMapping['${f.key}'] = parseInt(this.value)">
-        ${sel}
+  grid.innerHTML = fields.map(f => `
+    <div class="xl-map-row">
+      <label class="xl-map-label">${f.label}${f.required ? ' <span style="color:var(--red)">*</span>' : ''}</label>
+      <select class="field-input xl-map-select" data-field="${f.key}" onchange="xlMapping['${f.key}'] = this.value === '' ? undefined : parseInt(this.value)">
+        <option value="">— Skip —</option>
+        ${xlHeaders.map((h, i) => `<option value="${i}" ${xlMapping[f.key] === i ? 'selected' : ''}>${escHtml(h)}</option>`).join('')}
       </select>
-    </div>`;
-  }).join('');
+    </div>
+  `).join('');
 }
 
 function xlNext() {
   // Validate required fields
-  if (xlMapping['firstName'] === undefined || xlMapping['firstName'] < 0 ||
-      xlMapping['lastName']  === undefined || xlMapping['lastName']  < 0) {
-    showToast('Please map First Name and Last Name columns.', 'error');
-    return;
+  if (xlMapping.firstName === undefined) {
+    showToast('First Name column is required.', 'error'); return;
   }
-  // Read current select values
-  for (const key of Object.keys(FIELD_ALIASES)) {
-    const el = document.getElementById('xlmap-' + key);
-    if (el) xlMapping[key] = parseInt(el.value);
+  if (!xlMapping._singleName && xlMapping.lastName === undefined) {
+    showToast('Last Name column is required (or map a single Name column).', 'error'); return;
   }
-  renderPreview();
+
   document.getElementById('xl-step2').style.display = 'none';
   document.getElementById('xl-step3').style.display = 'block';
-  document.getElementById('xl-next-btn').style.display   = 'none';
+  document.getElementById('xl-next-btn').style.display = 'none';
   document.getElementById('xl-import-btn').style.display = 'inline-flex';
-}
 
-function renderPreview() {
-  const get = (row, key) => xlMapping[key] >= 0 ? String(row[xlMapping[key]] || '').trim() : '';
-  const preview = xlRawRows.slice(0,20);
-  document.getElementById('xl-preview-info').innerHTML = `
-    <div class="xl-tip">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-      <div>Showing first ${Math.min(20,xlRawRows.length)} of <strong>${xlRawRows.length} employees</strong> to be imported. Review and click <strong>Import Employees</strong>.</div>
-    </div>`;
-  document.getElementById('xl-preview-body').innerHTML = preview.map(row => {
-    let first = get(row,'firstName');
-    let last  = get(row,'lastName');
-    
-    // If we have a name field mapped to firstName, split it for preview
-    if (first && !last) {
-      const parts = first.split(' ');
-      if (parts.length >= 2) {
-        first = parts[0];
-        last = parts.slice(1).join(' ');
-      }
+  const previewBody = document.getElementById('xl-preview-body');
+  const previewRows = xlRawRows.slice(0, 10);
+
+  previewBody.innerHTML = previewRows.map(row => {
+    let firstName = '', lastName = '';
+    if (xlMapping._singleName) {
+      const parts = String(row[xlMapping.firstName] || '').trim().split(' ');
+      firstName = parts[0] || '';
+      lastName = parts.slice(1).join(' ') || '';
+    } else {
+      firstName = String(row[xlMapping.firstName] || '').trim();
+      lastName = xlMapping.lastName !== undefined ? String(row[xlMapping.lastName] || '').trim() : '';
     }
-    
     return `<tr>
-      <td>${escHtml(first)}</td>
-      <td>${escHtml(last)}</td>
-      <td class="bc-mono">${escHtml(get(row,'employeeId'))}</td>
-      <td>${escHtml(get(row,'productionCentre'))}</td>
-      <td>${escHtml(get(row,'department'))}</td>
-      <td>${escHtml(get(row,'phone'))}</td>
+      <td>${escHtml(firstName)}</td>
+      <td>${escHtml(lastName)}</td>
+      <td>${xlMapping.employeeId !== undefined ? escHtml(row[xlMapping.employeeId] || '') : '—'}</td>
+      <td>${xlMapping.productionCentre !== undefined ? escHtml(row[xlMapping.productionCentre] || '') : '—'}</td>
+      <td>${xlMapping.department !== undefined ? escHtml(row[xlMapping.department] || '') : '—'}</td>
+      <td>${xlMapping.phone !== undefined ? escHtml(row[xlMapping.phone] || '') : '—'}</td>
     </tr>`;
   }).join('');
+
+  document.getElementById('xl-preview-info').innerHTML = `Showing first <strong>${previewRows.length}</strong> of <strong>${xlRawRows.length}</strong> employees`;
 }
 
 function xlDoImport() {
-  const get = (row, key) => xlMapping[key] >= 0 ? String(row[xlMapping[key]] || '').trim() : '';
-  const existing = DB.employees;
-  let added = 0, skipped = 0;
-
+  let imported = 0;
   xlRawRows.forEach(row => {
-    let first = get(row, 'firstName');
-    let last  = get(row, 'lastName');
-    
-    // If we have a name field mapped to firstName, split it
-    if (first && !last) {
-      const parts = first.split(' ');
-      if (parts.length >= 2) {
-        first = parts[0];
-        last = parts.slice(1).join(' ');
-      }
+    let firstName = '', lastName = '';
+    if (xlMapping._singleName) {
+      const parts = String(row[xlMapping.firstName] || '').trim().split(' ');
+      firstName = parts[0] || '';
+      lastName = parts.slice(1).join(' ') || '';
+    } else {
+      firstName = String(row[xlMapping.firstName] || '').trim();
+      lastName = xlMapping.lastName !== undefined ? String(row[xlMapping.lastName] || '').trim() : '';
     }
-    
-    if (!first || !last) { skipped++; return; }
+    if (!firstName) return;
+
     const emp = {
-      id:               uid(),
-      firstName:        first,
-      lastName:         last,
-      employeeId:       get(row,'employeeId'),
-      productionCentre: get(row,'productionCentre'),
-      department:       get(row,'department'),
-      phone:            get(row,'phone'),
-      notes:            get(row,'notes'),
-      createdAt:        new Date().toISOString()
+      id: uid(), firstName, lastName,
+      employeeId: xlMapping.employeeId !== undefined ? String(row[xlMapping.employeeId] || '').trim() : '',
+      productionCentre: xlMapping.productionCentre !== undefined ? String(row[xlMapping.productionCentre] || '').trim() : '',
+      department: xlMapping.department !== undefined ? String(row[xlMapping.department] || '').trim() : '',
+      phone: xlMapping.phone !== undefined ? String(row[xlMapping.phone] || '').trim() : '',
+      notes: xlMapping.notes !== undefined ? String(row[xlMapping.notes] || '').trim() : '',
+      createdAt: new Date().toISOString()
     };
-    existing.push(emp);
-    added++;
+    DB.addEmployee(emp);
+    CloudSync.pushEmployee(emp);
+    imported++;
   });
 
-  DB.saveEmployees(existing);
   closeModal('excel-import-modal');
-  showToast(`✓ ${added} employees imported${skipped ? `, ${skipped} skipped (missing name)` : ''}!`, 'success');
+  showToast(`✓ Imported ${imported} employees!`, 'success');
   renderEmployeeList();
 }
 
 function downloadTemplate() {
-  const csv = 'First Name,Last Name,Employee ID,Production Centre,Department,Phone,Notes\nJohn,Smith,EMP-001,Main Plant,Packaging,555-1234,\nJane,Doe,EMP-002,Warehouse A,Shipping,,';
-  const blob = new Blob([csv], {type:'text/csv'});
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a'); a.href = url;
-  a.download = 'unitrack_employees_template.csv'; a.click();
+  const csv = 'First Name,Last Name,Employee ID,Production Centre,Department,Phone,Notes\nJohn,Smith,EMP-001,Main Plant,Packaging,+1 555-1234,\nJane,Doe,EMP-002,Warehouse A,Shipping,+1 555-5678,Night shift\n';
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'unitrack_employee_template.csv';
+  a.click();
   URL.revokeObjectURL(url);
-  showToast('Template downloaded!', 'success');
 }
 
 // ============================================================
-// MODAL HELPERS
+// GLOBAL EXPORTS (for onclick handlers in HTML)
 // ============================================================
-function openModal(id) {
-  const el = document.getElementById(id);
-  el.style.display = 'flex';
-  setTimeout(() => el.classList.add('open'), 10);
-}
-function closeModal(id) {
-  const el = document.getElementById(id);
-  el.classList.remove('open');
-  setTimeout(() => { el.style.display = 'none'; }, 200);
-}
-function closeModalIfBg(e, id) { if (e.target === e.currentTarget) closeModal(id); }
-
-function confirm_dialog(title, message, onConfirm) {
-  document.getElementById('confirm-title').textContent   = title;
-  document.getElementById('confirm-message').textContent = message;
-  const overlay   = document.getElementById('confirm-overlay');
-  overlay.style.display = 'flex';
-  setTimeout(() => overlay.classList.add('open'), 10);
-  const cleanup = () => { overlay.classList.remove('open'); setTimeout(() => { overlay.style.display='none'; }, 200); };
-  document.getElementById('confirm-ok').onclick     = () => { cleanup(); onConfirm(); };
-  document.getElementById('confirm-cancel').onclick = cleanup;
-}
-
-// ============================================================
-// TOAST
-// ============================================================
-let toastTimer;
-function showToast(msg, type = 'success') {
-  const toast = document.getElementById('toast');
-  const icon  = type === 'success' ? '✓' : '⚠';
-  toast.innerHTML = `<span class="toast-icon">${icon}</span> ${escHtml(msg)}`;
-  toast.className = `toast ${type} show`;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
-}
+window.toggleSidebar = toggleSidebar;
+window.showPage = showPage;
+window.setAction = setAction;
+window.setReport = setReport;
+window.onScannerFocus = onScannerFocus;
+window.onScannerBlur = onScannerBlur;
+window.onBarcodeInput = onBarcodeInput;
+window.handleBarcodeKey = handleBarcodeKey;
+window.filterScanEmployees = filterScanEmployees;
+window.showEmpDropdown = showEmpDropdown;
+window.selectEmployee = selectEmployee;
+window.clearEmployee = clearEmployee;
+window.openManualEntry = openManualEntry;
+window.manualSubmit = manualSubmit;
+window.openEmployeeModal = openEmployeeModal;
+window.saveEmployee = saveEmployee;
+window.deleteEmployee = deleteEmployee;
+window.showEmployeeDetail = showEmployeeDetail;
+window.renderEmployeeList = renderEmployeeList;
+window.renderReport = renderReport;
+window.clearDates = clearDates;
+window.exportCSV = exportCSV;
+window.exportJSON = exportJSON;
+window.importJSON = importJSON;
+window.addCentre = addCentre;
+window.removeCentre = removeCentre;
+window.addUniformType = addUniformType;
+window.removeType = removeType;
+// window.cleanupDatabase = cleanupDatabase; (Replaced by Smart Cleanup)
+window.clearAllData = clearAllData;
+window.openExcelImport = openExcelImport;
+window.handleExcelFile = handleExcelFile;
+window.xlNext = xlNext;
+window.xlDoImport = xlDoImport;
+window.downloadTemplate = downloadTemplate;
+window.openUserModal = openUserModal;
+window.saveUser = saveUser;
+window.deleteUser = deleteUser;
+window.renderUsers = renderUsers;
+window.deleteTransaction = deleteTransaction;
+window.closeModal = closeModal;
+window.closeModalIfBg = closeModalIfBg;
+window.openModal = openModal;
+window.confirm_dialog = confirm_dialog;

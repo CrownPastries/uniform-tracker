@@ -491,6 +491,31 @@ body {
   background: rgba(248, 81, 73, 0.2);
 }
 
+.btn-warning {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255, 193, 7, 0.1);
+  color: #f59e0b;
+  border: 1px solid rgba(255, 193, 7, 0.3);
+  border-radius: 8px;
+  padding: 9px 18px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.btn-warning svg {
+  width: 16px;
+  height: 16px;
+}
+
+.btn-warning:hover {
+  background: rgba(255, 193, 7, 0.2);
+}
+
+
 .btn-text {
   background: none;
   border: none;
@@ -2730,5 +2755,377 @@ body[data-role="manager"] .admin-only {
 @media (max-width: 600px) {
   .xl-mapping-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+/* ============================================================
+   INFERRED TRANSACTION INDICATORS
+   ============================================================ */
+.inferred-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.72rem;
+  color: var(--text3);
+  font-style: italic;
+}
+.inferred-indicator svg {
+  width: 13px;
+  height: 13px;
+  opacity: 0.6;
+}
+.scan-feed-item.inferred {
+  border-left: 3px dashed var(--text3);
+  opacity: 0.75;
+}
+.report-table tr.inferred-row {
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 8px,
+    rgba(139,92,246,0.03) 8px,
+    rgba(139,92,246,0.03) 16px
+  ) !important;
+}
+.report-table tr.inferred-row td:first-child::before {
+  content: '⚙ ';
+  font-size: 0.8em;
+  opacity: 0.5;
+}
+
+/* Workflow state badges */
+.state-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 99px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.state-badge.warehouse    { background: rgba(37,99,235,0.1); color: #2563eb; }
+.state-badge.with_employee { background: rgba(245,158,11,0.1); color: #d97706; }
+.state-badge.soil_bin     { background: rgba(107,114,128,0.1); color: #6b7280; }
+.state-badge.at_cintas    { background: rgba(139,92,246,0.1); color: #8b5cf6; }
+.state-badge.damaged      { background: rgba(239,68,68,0.1); color: #ef4444; }
+.state-badge.unknown      { background: rgba(107,114,128,0.05); color: #9ca3af; }
+
+/* Scan page state warning */
+.scan-state-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  margin: 8px 0;
+  border-radius: 10px;
+  font-size: 0.84rem;
+  font-weight: 500;
+  animation: fadeIn 0.3s ease;
+}
+.scan-state-info.warn {
+  background: rgba(245,158,11,0.08);
+  border: 1px solid rgba(245,158,11,0.2);
+  color: #92400e;
+}
+.scan-state-info.info {
+  background: rgba(37,99,235,0.06);
+  border: 1px solid rgba(37,99,235,0.15);
+  color: #1e40af;
+}
+.scan-state-info.infer {
+  background: rgba(139,92,246,0.06);
+  border: 1px solid rgba(139,92,246,0.15);
+  color: #6d28d9;
+}
+
+/* Inference confirm dialog */
+.inference-list {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0;
+}
+.inference-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin-bottom: 6px;
+  background: rgba(139,92,246,0.05);
+  border: 1px dashed rgba(139,92,246,0.2);
+  border-radius: 8px;
+  font-size: 0.84rem;
+  color: var(--text2);
+}
+.inference-list li svg {
+  width: 16px;
+  height: 16px;
+  color: var(--purple);
+  flex-shrink: 0;
+}
+
+/* Users page */
+#page-users .report-table td .role-badge {
+  padding: 3px 10px;
+  border-radius: 99px;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.role-badge.admin    { background: rgba(239,68,68,0.1); color: #dc2626; }
+.role-badge.operator { background: rgba(37,99,235,0.1); color: #2563eb; }
+.role-badge.warehouse{ background: rgba(16,185,129,0.1); color: #059669; }
+.role-badge.manager  { background: rgba(139,92,246,0.1); color: #8b5cf6; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ============================================================
+   iOS KEYBOARD TRIGGER BUTTON
+   ============================================================ */
+.kb-trigger-btn {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  padding: 4px 6px;
+  border-radius: 8px;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--text3);
+  transition: color var(--transition), background var(--transition);
+  /* Only visible on touch devices — hidden on desktop */
+  display: none;
+}
+
+/* Show only on touch-capable screens */
+@media (hover: none) and (pointer: coarse) {
+  .kb-trigger-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+}
+
+.kb-trigger-btn:active {
+  background: rgba(37,99,235,0.1);
+  color: var(--blue);
+}
+
+/* Make search-box flex so the ⌨ button sits inline */
+.search-box,
+.report-search-box {
+  display: flex !important;
+  align-items: center;
+}
+
+/* ============================================================
+   EMPLOYEE GRID TABLE & PERMISSION VISIBILITY
+   ============================================================ */
+body[data-role="warehouse"] .employee-manage-only,
+body[data-role="manager"] .employee-manage-only {
+  display: none !important;
+}
+
+.employee-table-wrap {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 14px 30px rgba(15, 23, 42, 0.05);
+  overflow: hidden;
+}
+
+.employee-grid-table {
+  width: 100%;
+  font-size: 0.84rem;
+}
+
+.employee-grid-header {
+  display: grid;
+  grid-template-columns: 3.5fr 2.5fr 2.5fr 1.5fr;
+  background: var(--bg3);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--text2);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.employee-grid-header > div {
+  padding: 14px 18px;
+}
+
+.employee-grid-row {
+  display: grid;
+  grid-template-columns: 3.5fr 2.5fr 2.5fr 1.5fr;
+  border-bottom: 1px solid var(--border);
+  background: var(--card-bg);
+  transition: background var(--transition);
+  align-items: center;
+}
+
+.employee-grid-row:last-child {
+  border-bottom: none;
+}
+
+.emp-row-info,
+.emp-row-actions {
+  display: contents;
+}
+
+.emp-row-info > div,
+.emp-row-actions > div {
+  padding: 14px 18px;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+}
+
+.employee-grid-row:hover .emp-row-info > div,
+.employee-grid-row:hover .emp-row-actions > div {
+  background: var(--bg3);
+}
+
+/* Table Name Cell with Avatar */
+.emp-avatar-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.emp-name-held-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+.emp-table-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.emp-table-held {
+  font-size: 0.75rem;
+  color: var(--text2);
+  margin-top: 2px;
+}
+
+.emp-table-held strong {
+  color: var(--orange);
+}
+
+.emp-table-dept, .emp-table-centre {
+  font-size: 0.84rem;
+  color: var(--text2);
+}
+
+/* Actions list & buttons */
+.emp-actions-flex {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mobile-close-btn, .mobile-trigger-btn {
+  display: none !important;
+}
+
+/* Mobile responsive swappable panels style */
+@media (max-width: 768px) {
+  .employee-grid-header {
+    display: none !important;
+  }
+  
+  .employee-grid-row {
+    display: block !important;
+    position: relative;
+    overflow: hidden;
+    height: 76px;
+    border-bottom: 1px solid var(--border);
+  }
+  
+  .employee-grid-row > div {
+    padding: 0 !important;
+  }
+  
+  .emp-row-info {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    box-sizing: border-box;
+    transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    z-index: 10;
+  }
+  
+  /* Hide the actual columns on mobile info panel, except avatar/name cell */
+  .emp-table-dept,
+  .emp-table-centre {
+    display: none !important;
+  }
+  
+  /* Create layout for small pills inside cell on mobile */
+  .emp-name-held-wrap {
+    gap: 4px;
+  }
+  
+  .emp-mobile-meta-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+  }
+  
+  .emp-mobile-pill {
+    font-size: 0.68rem;
+    font-weight: 500;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text2);
+  }
+  
+  .emp-row-actions {
+    position: absolute;
+    top: 0;
+    left: 100%;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding: 0 16px;
+    box-sizing: border-box;
+    background: var(--bg3);
+    transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    z-index: 20;
+    border-bottom: 1px solid var(--border);
+  }
+  
+  .emp-actions-flex {
+    width: 100%;
+    justify-content: space-around;
+  }
+  
+  /* Swapping states */
+  .employee-grid-row.swipe-active .emp-row-info {
+    transform: translateX(-100%);
+  }
+  
+  .employee-grid-row.swipe-active .emp-row-actions {
+    transform: translateX(-100%);
+  }
+  
+  .mobile-close-btn,
+  .mobile-trigger-btn {
+    display: flex !important;
   }
 }

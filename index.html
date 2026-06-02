@@ -2,14 +2,16 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content" />
   <title>UniTrack — Uniform Management System</title>
   <meta name="description" content="Track uniform distribution, returns, and movement between warehouse, employees, and Cintas cleaning company." />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>👔</text></svg>">
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=2" />
+  <link rel="stylesheet" href="styles.css?v=7" />
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+
 </head>
 <body>
   <!-- Login Overlay -->
@@ -148,7 +150,7 @@
           </div>
           <div class="quick-actions" style="margin-top:0">
             <button class="qa-btn" onclick="showPage('reports');setTimeout(()=>setReport('missing'),100)"><div class="qa-icon report"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg></div><span>Missing Items</span></button>
-            <button class="qa-btn admin-only" onclick="openEmployeeModal()"><div class="qa-icon emp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg></div><span>Add Employee</span></button>
+            <button class="qa-btn employee-manage-only" onclick="openEmployeeModal()"><div class="qa-icon emp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg></div><span>Add Employee</span></button>
             <button class="qa-btn" onclick="showPage('reports')"><div class="qa-icon warehouse"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div><span>All Reports</span></button>
           </div>
         </div>
@@ -158,14 +160,18 @@
     <!-- EMPLOYEES -->
     <section id="page-employees" class="page">
       <div class="page-toolbar">
-        <div class="search-box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><input type="text" id="emp-search" placeholder="Search employees..." oninput="renderEmployeeList()" /></div>
+        <div class="search-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="emp-search" placeholder="Search employees..." inputmode="text" autocomplete="off" autocorrect="off" autocapitalize="words" oninput="renderEmployeeList()" />
+          <button class="kb-trigger-btn" onclick="forceKeyboard('emp-search')" title="Show keyboard">⌨</button>
+        </div>
         <button class="btn-secondary" onclick="openExcelImport()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
           Import from Excel
         </button>
-        <button class="btn-primary admin-only" onclick="openEmployeeModal()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add Employee</button>
+        <button class="btn-primary employee-manage-only" onclick="openEmployeeModal()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add Employee</button>
       </div>
-      <div id="employee-list" class="employee-grid"></div>
+      <div id="employee-list" class="employee-table-wrap"></div>
     </section>
 
     <!-- SCAN ENTRY -->
@@ -202,9 +208,15 @@
           <!-- Employee selector (shown only for distribute/return) -->
           <div class="employee-selector" id="employee-selector">
             <label class="field-label">Employee</label>
-            <div class="emp-search-wrapper">
+          <div class="emp-search-wrapper">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
-              <input type="text" id="scan-emp-search" placeholder="Search name or employee ID..." autocomplete="off" oninput="filterScanEmployees()" onfocus="showEmpDropdown()" />
+              <input type="text" id="scan-emp-search"
+                placeholder="Search name or employee ID..."
+                inputmode="text"
+                autocomplete="off" autocorrect="off" autocapitalize="words" spellcheck="false"
+                oninput="filterScanEmployees()"
+                onfocus="showEmpDropdown()" />
+              <button class="kb-trigger-btn" onclick="forceKeyboard('scan-emp-search')" title="Show keyboard">⌨</button>
               <button class="clear-btn" id="clearEmpBtn" onclick="clearEmployee()" style="display:none">✕</button>
             </div>
             <div id="scan-emp-dropdown" class="emp-dropdown hidden"></div>
@@ -226,6 +238,7 @@
               </div>
               <!-- Hidden input that receives barcode scanner input -->
               <input type="text" id="barcodeInput" class="barcode-input-hidden"
+                     inputmode="none"
                      autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
                      onkeydown="handleBarcodeKey(event)"
                      oninput="onBarcodeInput()"
@@ -277,7 +290,11 @@
           <label>To <input type="date" id="report-to" oninput="renderReport()" /></label>
           <button class="btn-text" onclick="clearDates()">Clear</button>
         </div>
-        <div class="report-search-box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><input type="text" id="report-search" placeholder="Filter results..." oninput="renderReport()" /></div>
+        <div class="report-search-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="report-search" placeholder="Filter results..." inputmode="text" autocomplete="off" autocorrect="off" autocapitalize="off" oninput="renderReport()" />
+          <button class="kb-trigger-btn" onclick="forceKeyboard('report-search')" title="Show keyboard">⌨</button>
+        </div>
         <button class="btn-secondary" onclick="exportCSV()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Export CSV</button>
       </div>
       <div id="report-content" class="report-content"></div>
@@ -306,27 +323,27 @@
             <label class="btn-secondary file-label admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Import (Admin Only)<input type="file" accept=".json" id="importFile" onchange="importJSON(event)" style="display:none" /></label>
           </div>
         </div>
-        <!-- Cloud Sync Card -->
+        <!-- Supabase Sync Card -->
         <div class="card" style="grid-column: 1 / -1">
           <div class="card-header">
             <h2 class="card-title">
               <span id="cloud-status-dot" class="cloud-dot off"></span>
-              Cloud Sync — Google Sheets
+              Database — Supabase
             </h2>
-            <span id="cloud-status-text" class="cloud-status-text">Never synced</span>
+            <span id="cloud-status-text" class="cloud-status-text">Not connected</span>
           </div>
-          <p class="card-desc">Connect to Google Sheets so all data is backed up online and shared across devices. Requires a Google Apps Script web app — see <strong>SETUP_GUIDE.md</strong> for step-by-step instructions.</p>
+          <p class="card-desc">Connect to your Supabase project for real-time sync across all devices. Enter your project URL and anon key from the Supabase dashboard → Project Settings → API.</p>
           <div class="form-grid" style="margin: 16px 0 12px">
             <div class="field-group field-group-full">
-              <label class="field-label">Google Apps Script Web App URL</label>
-              <input type="url" id="cloud-url" class="field-input" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off" />
+              <label class="field-label">Supabase Project URL</label>
+              <input type="url" id="cloud-url" class="field-input" placeholder="https://xxxxxxxxxxxx.supabase.co" autocomplete="off" />
             </div>
             <div class="field-group">
-              <label class="field-label">API Key (must match Code.gs)</label>
-              <input type="password" id="cloud-key" class="field-input" placeholder="Your secret key" autocomplete="off" />
+              <label class="field-label">Supabase Anon Key</label>
+              <input type="password" id="cloud-key" class="field-input" placeholder="eyJhbGci..." autocomplete="off" />
             </div>
             <div class="field-group" style="display:flex; align-items:flex-end">
-              <button class="btn-primary" style="width:100%" onclick="saveCloudConfig()">Save Config</button>
+              <button class="btn-primary" style="width:100%" onclick="saveCloudConfig()">Save & Connect</button>
             </div>
           </div>
           <div class="settings-actions">
@@ -336,24 +353,54 @@
             </button>
             <button class="btn-secondary" id="cloud-sync-now-btn" onclick="cloudSyncNow()">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
-              Sync Now
+              Pull from Supabase
             </button>
             <button class="btn-secondary" id="cloud-sync-btn" onclick="cloudSyncAll()">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
-              Push All to Cloud
-            </button>
-            <button class="btn-secondary" id="cloud-pull-btn" onclick="cloudPullAll()">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              Pull from Cloud
+              Push All to Supabase
             </button>
           </div>
         </div>
 
+
+        <!-- Smart Cleanup Card -->
+        <div class="card admin-only" style="grid-column: 1 / -1; border: 1.5px solid rgba(139,92,246,0.25); background: rgba(139,92,246,0.03)">
+          <div class="card-header">
+            <h2 class="card-title">🧹 Smart Database Cleanup</h2>
+          </div>
+          <p class="card-desc">Fixes two problems from the old app: <strong>removes duplicate transactions</strong> recorded by v1 bugs, and <strong>retroactively injects missing workflow steps</strong> (e.g. shirts still showing as held by employees that were actually returned to Cintas). Shows a full preview before making any changes.</p>
+          <div class="settings-actions" style="margin-top:12px">
+            <button id="smart-cleanup-btn" class="btn-primary" onclick="runSmartCleanup()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M8 6v12a2 2 0 002 2h4a2 2 0 002-2V6"/><path d="M19 6l-1 14"/><path d="M5 6l1 14"/><line x1="12" y1="6" x2="12" y2="18"/></svg>
+              Analyse &amp; Preview Cleanup
+            </button>
+          </div>
+        </div>
         <div class="card card-danger admin-only">
           <div class="card-header"><h2 class="card-title">Danger Zone</h2></div>
-          <p class="card-desc">Permanently delete all data. This cannot be undone.</p>
-          <button class="btn-danger" onclick="clearAllData()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>Clear All Data</button>
+          <p class="card-desc">Permanently delete all local and cloud data. This cannot be undone.</p>
+          <div class="settings-actions">
+            <button class="btn-danger" onclick="clearAllData()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>Clear All Local Data</button>
+          </div>
         </div>
+      </div>
+    </section>
+
+    <!-- USERS -->
+    <section id="page-users" class="page">
+      <div class="page-toolbar">
+        <div class="search-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="user-search" placeholder="Search users..." inputmode="text" autocomplete="off" autocorrect="off" autocapitalize="off" oninput="renderUsers()" />
+          <button class="kb-trigger-btn" onclick="forceKeyboard('user-search')" title="Show keyboard">⌨</button>
+        </div>
+        <button class="btn-primary" onclick="openUserModal()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add User</button>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="report-table-wrap"><table class="report-table">
+          <thead><tr><th>Username</th><th>Role</th><th>Actions</th></tr></thead>
+          <tbody id="users-tbody"></tbody>
+        </table></div>
       </div>
     </section>
   </main>
@@ -369,7 +416,12 @@
         <p style="font-size:0.84rem;color:var(--text2);margin-bottom:18px">Use this when the scanner is unavailable. Each barcode you type and submit will be logged immediately.</p>
         <div class="field-group">
           <label class="field-label">Barcode</label>
-          <input type="text" id="manual-barcode" class="field-input" placeholder="Type barcode here..." autocomplete="off" onkeydown="if(event.key==='Enter'){event.preventDefault();manualSubmit()}" style="font-family:monospace;font-size:1.1rem;letter-spacing:0.08em" />
+          <input type="text" id="manual-barcode" class="field-input"
+            placeholder="Type barcode here..."
+            inputmode="numeric"
+            autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();manualSubmit()}"
+            style="font-family:monospace;font-size:1.1rem;letter-spacing:0.08em" />
         </div>
         <div class="field-group" style="margin-top:12px">
           <label class="field-label">Notes (optional)</label>
@@ -415,6 +467,22 @@
         <h3 class="section-subtitle">Uniform History</h3>
         <div id="emp-detail-uniforms"></div>
       </div>
+    </div>
+  </div>
+
+  <!-- User Modal -->
+  <div id="user-modal" class="modal-overlay" onclick="closeModalIfBg(event,'user-modal')">
+    <div class="modal" style="max-width:440px">
+      <div class="modal-header"><h2 id="user-modal-title">Add User</h2><button class="modal-close" onclick="closeModal('user-modal')">✕</button></div>
+      <div class="modal-body">
+        <input type="hidden" id="user-edit-idx" />
+        <div class="form-grid">
+          <div class="field-group"><label class="field-label" for="user-username">Username *</label><input type="text" id="user-username" class="field-input" placeholder="Username" /></div>
+          <div class="field-group"><label class="field-label" for="user-password">Password *</label><input type="text" id="user-password" class="field-input" placeholder="Password" /></div>
+          <div class="field-group field-group-full"><label class="field-label" for="user-role">Role *</label><select id="user-role" class="field-input"><option value="admin">Admin</option><option value="operator">Operator</option><option value="warehouse">Warehouse</option><option value="manager">Manager (View Only)</option></select></div>
+        </div>
+      </div>
+      <div class="modal-footer"><button class="btn-secondary" onclick="closeModal('user-modal')">Cancel</button><button class="btn-primary" onclick="saveUser()">Save User</button></div>
     </div>
   </div>
 
@@ -505,6 +573,6 @@
   </div> <!-- End App Wrapper -->
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-  <script src="app.js?v=9"></script>
+  <script src="app.js?v=16"></script>
 </body>
 </html>
