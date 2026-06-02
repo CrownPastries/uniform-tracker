@@ -414,8 +414,7 @@ function estimateMidDate(dateA, dateB) {
 
 // Column mapping: v3 camelCase ↔ Supabase snake_case
 function empToSupabase(e) {
-  return {
-    id: e.id,
+  const row = {
     first_name: e.firstName || '',
     last_name: e.lastName || '',
     employee_id_number: e.employeeId || null,
@@ -424,6 +423,10 @@ function empToSupabase(e) {
     phone: e.phone || null,
     notes: e.notes || null
   };
+  if (e.id && isValidUUID(e.id)) {
+    row.id = e.id;
+  }
+  return row;
 }
 
 function empFromSupabase(row) {
@@ -441,15 +444,18 @@ function empFromSupabase(row) {
 }
 
 function txnToSupabase(t) {
-  return {
-    id: t.id,
+  const row = {
     barcode: t.barcode,
     action: t.action,
-    employee_id: t.employeeId || null,
+    employee_id: t.employeeId && isValidUUID(t.employeeId) ? t.employeeId : null,
     uniform_type: t.uniformType || null,
     notes: t.notes ? (t.inferred ? '[AUTO] ' + t.notes : t.notes) : (t.inferred ? '[AUTO]' : null),
     date: t.date || today()
   };
+  if (t.id && isValidUUID(t.id)) {
+    row.id = t.id;
+  }
+  return row;
 }
 
 function txnFromSupabase(row, employeeMap) {
@@ -909,7 +915,21 @@ function stopAutoSync() {
 // ============================================================
 // UTILITIES
 // ============================================================
-function uid()  { return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
+function isValidUUID(str) {
+  if (typeof str !== 'string') return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
+}
+
+function uid() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
 function today(){ return new Date().toISOString().slice(0,10); }
 function normalizeDate(d) {
   if (!d) return today();
@@ -3017,7 +3037,10 @@ async function applySmartCleanup(finalTxns) {
       for (let i = 0; i < barcodes.length; i += 100) {
         const batch = barcodes.slice(i, i + 100);
         const { error } = await sb.from('transactions').delete().in('barcode', batch);
-        if (error) throw new Error('Delete failed: ' + error.message);
+        if (error) {
+          console.error('Delete failed details:', error);
+          throw new Error('Delete failed: ' + error.message);
+        }
       }
 
       // Re-insert the clean transactions
@@ -3025,7 +3048,10 @@ async function applySmartCleanup(finalTxns) {
       for (let i = 0; i < rows.length; i += 500) {
         const { error } = await sb.from('transactions')
           .insert(rows.slice(i, i + 500));
-        if (error) throw new Error('Re-insert failed: ' + error.message);
+        if (error) {
+          console.error('Re-insert failed details:', error);
+          throw new Error('Re-insert failed: ' + error.message);
+        }
       }
     }
 
