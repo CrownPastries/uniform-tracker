@@ -332,55 +332,16 @@
             </h2>
             <span id="cloud-status-text" class="cloud-status-text">Not connected</span>
           </div>
-          <p class="card-desc">Connect to your Supabase project for real-time sync across all devices. Enter your project URL and anon key from the Supabase dashboard → Project Settings → API.</p>
-          <div class="form-grid" style="margin: 16px 0 12px">
-            <div class="field-group field-group-full">
-              <label class="field-label">Supabase Project URL</label>
-              <input type="url" id="cloud-url" class="field-input" placeholder="https://xxxxxxxxxxxx.supabase.co" autocomplete="off" />
-            </div>
-            <div class="field-group">
-              <label class="field-label">Supabase Anon Key</label>
-              <input type="password" id="cloud-key" class="field-input" placeholder="eyJhbGci..." autocomplete="off" />
-            </div>
-            <div class="field-group" style="display:flex; align-items:flex-end">
-              <button class="btn-primary" style="width:100%" onclick="saveCloudConfig()">Save & Connect</button>
-            </div>
-          </div>
-          <div class="settings-actions">
+          <p class="card-desc">Real-time sync is configured securely in the background. You can manually test the connection or push/pull offline changes.</p>
+          <div class="settings-actions" style="margin-top:16px">
             <button class="btn-secondary" id="cloud-test-btn" onclick="cloudTestConn()">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
               Test Connection
             </button>
-            <button class="btn-secondary" id="cloud-sync-now-btn" onclick="cloudSyncNow()">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
-              Pull from Supabase
-            </button>
-            <button class="btn-secondary" id="cloud-sync-btn" onclick="cloudSyncAll()">
+            <button class="btn-primary" id="cloud-sync-master-btn" onclick="manualSync()">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
-              Push All to Supabase
+              Sync Data
             </button>
-          </div>
-        </div>
-
-
-        <!-- Smart Cleanup Card -->
-        <div class="card admin-only" style="grid-column: 1 / -1; border: 1.5px solid rgba(139,92,246,0.25); background: rgba(139,92,246,0.03)">
-          <div class="card-header">
-            <h2 class="card-title">🧹 Smart Database Cleanup</h2>
-          </div>
-          <p class="card-desc">Fixes two problems from the old app: <strong>removes duplicate transactions</strong> recorded by v1 bugs, and <strong>retroactively injects missing workflow steps</strong> (e.g. shirts still showing as held by employees that were actually returned to Cintas). Shows a full preview before making any changes.</p>
-          <div class="settings-actions" style="margin-top:12px">
-            <button id="smart-cleanup-btn" class="btn-primary" onclick="runSmartCleanup()">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M8 6v12a2 2 0 002 2h4a2 2 0 002-2V6"/><path d="M19 6l-1 14"/><path d="M5 6l1 14"/><line x1="12" y1="6" x2="12" y2="18"/></svg>
-              Analyse &amp; Preview Cleanup
-            </button>
-          </div>
-        </div>
-        <div class="card card-danger admin-only">
-          <div class="card-header"><h2 class="card-title">Danger Zone</h2></div>
-          <p class="card-desc">Permanently delete all local and cloud data. This cannot be undone.</p>
-          <div class="settings-actions">
-            <button class="btn-danger" onclick="clearAllData()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>Clear All Local Data</button>
           </div>
         </div>
       </div>
@@ -396,6 +357,31 @@
         </div>
         <button class="btn-primary" onclick="openUserModal()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add User</button>
       </div>
+
+      <div class="card" style="margin-top:16px; margin-bottom:24px;">
+        <div class="card-header">
+          <h2 class="card-title">Roles & Permissions</h2>
+        </div>
+        <p class="card-desc">Configure what each role is allowed to do in the system.</p>
+        <div class="report-table-wrap" style="margin-top:12px;">
+          <table class="report-table">
+            <thead>
+              <tr>
+                <th>Role</th>
+                <th>Manage Users</th>
+                <th>Manage Employees</th>
+                <th>Delete Txns</th>
+                <th>Export Data</th>
+              </tr>
+            </thead>
+            <tbody id="roles-tbody"></tbody>
+          </table>
+        </div>
+        <div class="settings-actions" style="margin-top:16px; justify-content:flex-end;">
+          <button class="btn-primary" onclick="saveRolePermissions()">Save Permissions</button>
+        </div>
+      </div>
+
       <div class="card" style="margin-top:16px">
         <div class="report-table-wrap"><table class="report-table">
           <thead><tr><th>Username</th><th>Role</th><th>Actions</th></tr></thead>

@@ -20,7 +20,7 @@ const IDB = {
   db: null,
   init() {
     return new Promise((resolve, reject) => {
-      const request = indexedDB.open('UniTrackDB', 2);
+      const request = indexedDB.open('UniTrackDB', 3);
       request.onupgradeneeded = (e) => {
         const db = e.target.result;
         if (!db.objectStoreNames.contains('store')) {
@@ -28,6 +28,9 @@ const IDB = {
         }
         if (!db.objectStoreNames.contains('transactions')) {
           db.createObjectStore('transactions', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('syncQueue')) {
+          db.createObjectStore('syncQueue', { keyPath: 'queueId' });
         }
       };
       request.onsuccess = (e) => {
@@ -117,6 +120,31 @@ const IDB = {
       // Yield to the browser
       await new Promise(r => setTimeout(r, 0));
     }
+  },
+  getSyncQueue() {
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction('syncQueue', 'readonly');
+      const req = tx.objectStore('syncQueue').getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  addToSyncQueue(item) {
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction('syncQueue', 'readwrite');
+      if (!item.queueId) item.queueId = uid();
+      const req = tx.objectStore('syncQueue').put(item);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  },
+  removeFromSyncQueue(queueId) {
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction('syncQueue', 'readwrite');
+      const req = tx.objectStore('syncQueue').delete(queueId);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
   }
 };
 
@@ -482,16 +510,8 @@ let _realtimeChannel = null;
 
 function getSupabase() {
   if (_supabaseClient) return _supabaseClient;
-  let url = localStorage.getItem('ut_cloud_url') || '';
-  let key = localStorage.getItem('ut_cloud_key') || '';
-  
-  // Default fallback credentials to ensure it connects instantly on fresh load
-  if (!url || !key) {
-    url = 'https://ruhovbdcnnukvobbejor.supabase.co';
-    key = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ1aG92YmRjbm51a3ZvYmJlam9yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAwMTc5NzksImV4cCI6MjA5NTU5Mzk3OX0.Yx769_aDtIdQhiiYuaDCcAq05QZPaCAhBpOxMrWm7Jc';
-    localStorage.setItem('ut_cloud_url', url);
-    localStorage.setItem('ut_cloud_key', key);
-  }
+  const url = 'https://ruhovbdcnnukvobbejor.supabase.co';
+  const key = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ1aG92YmRjbm51a3ZvYmJlam9yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAwMTc5NzksImV4cCI6MjA5NTU5Mzk3OX0.Yx769_aDtIdQhiiYuaDCcAq05QZPaCAhBpOxMrWm7Jc';
 
   try {
     _supabaseClient = window.supabase.createClient(url, key);
@@ -503,17 +523,50 @@ function getSupabase() {
 }
 
 const CloudSync = {
-  get apiUrl() { return localStorage.getItem('ut_cloud_url') || ''; },
-  get apiKey() { return localStorage.getItem('ut_cloud_key') || ''; },
-  isReady() { return !!(this.apiUrl && this.apiKey && _supabaseClient); },
+  isReady() { return !!_supabaseClient; },
 
-  configure(url, key) {
-    localStorage.setItem('ut_cloud_url', url.trim());
-    localStorage.setItem('ut_cloud_key', key.trim());
-    // Reset client so it's recreated with new credentials
-    _supabaseClient = null;
-    if (_realtimeChannel) { try { _realtimeChannel.unsubscribe(); } catch(e){} _realtimeChannel = null; }
-    getSupabase();
+  async manualSync() {
+    await this.processSyncQueue();
+    await this.pullAll();
+  },
+
+  async processSyncQueue() {
+    if (!navigator.onLine) return;
+    const sb = getSupabase();
+    if (!sb) return;
+    try {
+      const queue = await IDB.getSyncQueue();
+      if (!queue || queue.length === 0) return;
+      
+      console.log(`Processing sync queue with ${queue.length} items...`);
+      for (const item of queue) {
+        try {
+          if (item.type === 'pushTransaction') {
+             const row = txnToSupabase(item.payload);
+             const { error } = await sb.from('transactions').upsert(row, { onConflict: 'id' });
+             if (error) throw error;
+          } else if (item.type === 'deleteTransaction') {
+             const { error } = await sb.from('transactions').delete().eq('id', item.payload);
+             if (error) throw error;
+          } else if (item.type === 'pushEmployee') {
+             const row = empToSupabase(item.payload);
+             const { error } = await sb.from('employees').upsert(row, { onConflict: 'id' });
+             if (error) throw error;
+          } else if (item.type === 'removeEmployee') {
+             const { error } = await sb.from('employees').delete().eq('id', item.payload);
+             if (error) throw error;
+          }
+          await IDB.removeFromSyncQueue(item.queueId);
+        } catch (itemErr) {
+          console.warn('Failed to process queue item:', itemErr);
+          // Stop processing if we hit an error (likely offline again)
+          break;
+        }
+      }
+      updateSyncStatus();
+    } catch (e) {
+      console.error('Failed to process sync queue:', e);
+    }
   },
 
   // ── Transactions ──────────────────────────────────────────
@@ -521,10 +574,14 @@ const CloudSync = {
     const sb = getSupabase();
     if (!sb) return;
     try {
+      if (!navigator.onLine) throw new Error('Offline');
       const row = txnToSupabase(txn);
       const { error } = await sb.from('transactions').upsert(row, { onConflict: 'id' });
-      if (error) console.warn('Supabase pushTransaction error:', error.message);
-    } catch (e) { console.warn('pushTransaction failed:', e.message); }
+      if (error) throw error;
+    } catch (e) {
+      console.warn('pushTransaction failed, queuing:', e.message);
+      IDB.addToSyncQueue({ type: 'pushTransaction', payload: txn }).then(updateSyncStatus);
+    }
   },
 
   async pushTransactionsBulk(txns) {
@@ -544,9 +601,13 @@ const CloudSync = {
     const sb = getSupabase();
     if (!sb) return;
     try {
+      if (!navigator.onLine) throw new Error('Offline');
       const { error } = await sb.from('transactions').delete().eq('id', id);
-      if (error) console.warn('Supabase deleteTransaction error:', error.message);
-    } catch (e) { console.warn('deleteTransaction failed:', e.message); }
+      if (error) throw error;
+    } catch (e) {
+      console.warn('deleteTransaction failed, queuing:', e.message);
+      IDB.addToSyncQueue({ type: 'deleteTransaction', payload: id }).then(updateSyncStatus);
+    }
   },
 
   // ── Employees ─────────────────────────────────────────────
@@ -554,19 +615,27 @@ const CloudSync = {
     const sb = getSupabase();
     if (!sb) return;
     try {
+      if (!navigator.onLine) throw new Error('Offline');
       const row = empToSupabase(emp);
       const { error } = await sb.from('employees').upsert(row, { onConflict: 'id' });
-      if (error) console.warn('Supabase pushEmployee error:', error.message);
-    } catch (e) { console.warn('pushEmployee failed:', e.message); }
+      if (error) throw error;
+    } catch (e) {
+      console.warn('pushEmployee failed, queuing:', e.message);
+      IDB.addToSyncQueue({ type: 'pushEmployee', payload: emp }).then(updateSyncStatus);
+    }
   },
 
   async removeEmployee(id) {
     const sb = getSupabase();
     if (!sb) return;
     try {
+      if (!navigator.onLine) throw new Error('Offline');
       const { error } = await sb.from('employees').delete().eq('id', id);
-      if (error) console.warn('Supabase removeEmployee error:', error.message);
-    } catch (e) { console.warn('removeEmployee failed:', e.message); }
+      if (error) throw error;
+    } catch (e) {
+      console.warn('removeEmployee failed, queuing:', e.message);
+      IDB.addToSyncQueue({ type: 'removeEmployee', payload: id }).then(updateSyncStatus);
+    }
   },
 
   // ── Config ────────────────────────────────────────────────
@@ -722,20 +791,15 @@ const CloudSync = {
     }
   },
 
-  // ── Test Connection ────────────────────────────────────────
   async testConnection() {
-    const url = this.apiUrl;
-    const key = this.apiKey;
-    if (!url || !key) { showToast('Enter Supabase URL and Anon Key first.', 'error'); return; }
-    if (!url.includes('supabase.co') && !url.includes('supabase.io') && !url.includes('localhost')) {
-      showToast('URL should be your Supabase project URL (*.supabase.co)', 'error'); return;
-    }
+    const url = 'https://ruhovbdcnnukvobbejor.supabase.co';
+    const key = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ1aG92YmRjbm51a3ZvYmJlam9yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAwMTc5NzksImV4cCI6MjA5NTU5Mzk3OX0.Yx769_aDtIdQhiiYuaDCcAq05QZPaCAhBpOxMrWm7Jc';
 
     const btn = document.getElementById('cloud-test-btn');
-    if (btn) { btn.disabled = true; btn.textContent = 'Testing…'; }
+    if (btn) { btn.disabled = true; btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> Testing…'; }
 
     try {
-      // Recreate client with current input values (may not have been saved yet)
+      // Recreate client
       const testClient = window.supabase.createClient(url, key, { auth: { persistSession: false } });
       const { data, error } = await testClient.from('employees').select('id', { count: 'exact', head: true });
       if (error) {
@@ -763,53 +827,68 @@ const CloudSync = {
     } catch (e) {
       showToast('Connection failed: ' + e.message, 'error');
     } finally {
-      if (btn) { btn.disabled = false; btn.textContent = 'Test Connection'; }
+      if (btn) { btn.disabled = false; btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> Test Connection'; }
     }
   }
 };
 
-function updateSyncStatus() {
+async function updateSyncStatus() {
   const statusEl = document.getElementById('cloud-status-text');
   const dotEl    = document.getElementById('cloud-status-dot');
   const ts       = localStorage.getItem('ut_last_sync');
   const ready    = CloudSync.isReady();
+  
+  let queueLength = 0;
+  try {
+    const queue = await IDB.getSyncQueue();
+    queueLength = queue ? queue.length : 0;
+  } catch(e) {}
+
   if (statusEl) {
     let statusText = '';
     if (!ready) {
       statusText = 'Not connected';
+    } else if (!navigator.onLine) {
+      statusText = `Offline (${queueLength} pending)`;
     } else if (ts) {
       const minutesAgo = Math.floor((Date.now() - new Date(ts).getTime()) / 60000);
       if (minutesAgo < 1)   statusText = 'Last sync: Just now';
       else if (minutesAgo < 60) statusText = `Last sync: ${minutesAgo}m ago`;
       else                  statusText = `Last sync: ${Math.floor(minutesAgo / 60)}h ago`;
+      if (queueLength > 0) {
+        statusText += ` · ${queueLength} pending`;
+      }
     } else {
       statusText = 'Connected (never synced)';
     }
-    if (autoSyncInterval && ready) statusText += ' · Live';
+    if (autoSyncInterval && ready && navigator.onLine) statusText += ' · Live';
     statusEl.textContent = statusText;
   }
-  if (dotEl) dotEl.className = 'cloud-dot ' + (ready ? 'ready' : 'off');
-}
-
-function saveCloudConfig() {
-  const url = (document.getElementById('cloud-url')?.value || '').trim();
-  const key = (document.getElementById('cloud-key')?.value || '').trim();
-  if (!url || !key) { showToast('Please enter both Supabase URL and Anon Key.', 'error'); return; }
-  if (!url.startsWith('https://') && !url.startsWith('http://')) {
-    showToast('URL must start with https://', 'error'); return;
+  if (dotEl) {
+    dotEl.className = 'cloud-dot ' + (ready && navigator.onLine ? 'ready' : 'off');
+    if (queueLength > 0 && navigator.onLine) dotEl.classList.add('syncing');
   }
-  CloudSync.configure(url, key);
-  showToast('Supabase configuration saved! Testing connection…', 'success');
-  updateSyncStatus();
-  startAutoSync();
-  // Auto-pull after saving
-  setTimeout(() => CloudSync.pullAll(false), 500);
 }
 
-window.saveCloudConfig = saveCloudConfig;
-window.cloudSyncAll    = () => CloudSync.syncAll();
-window.cloudPullAll    = () => CloudSync.pullAll(false);
-window.cloudSyncNow    = () => CloudSync.pullAll(false);
+async function manualSync() {
+  const btn = document.getElementById('cloud-sync-master-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg> Syncing...'; }
+  try {
+    if (!navigator.onLine) {
+      showToast('Cannot sync while offline.', 'error');
+      return;
+    }
+    await CloudSync.processSyncQueue();
+    await CloudSync.pullAll(true);
+    showToast('Sync complete!', 'success');
+  } catch (e) {
+    showToast('Sync failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg> Sync Data'; }
+  }
+}
+
+window.manualSync      = manualSync;
 window.cloudTestConn   = () => CloudSync.testConnection();
 
 // Realtime subscription — get notified when other devices push new scans
@@ -1305,7 +1384,7 @@ window.handleLogout = handleLogout;
 // ============================================================
 // ROLE-BASED PERMISSIONS
 // ============================================================
-const ROLE_PERMISSIONS = {
+let ROLE_PERMISSIONS = {
   admin: {
     actions: ['received_from_cintas', 'distributed', 'reported_issue', 'returned', 'collected_from_soil_bin', 'sent_to_cintas'],
     canManageUsers: true, canManageEmployees: true, canDeleteTransactions: true, canExportData: true
@@ -1323,6 +1402,24 @@ const ROLE_PERMISSIONS = {
     canManageUsers: false, canManageEmployees: false, canDeleteTransactions: false, canExportData: false
   }
 };
+
+function loadRolePermissions() {
+  const saved = localStorage.getItem('ut_role_permissions');
+  if (saved) {
+    try {
+      ROLE_PERMISSIONS = JSON.parse(saved);
+    } catch (e) {
+      console.error('Failed to parse saved role permissions', e);
+    }
+  }
+}
+loadRolePermissions();
+
+function saveRolePermissions() {
+  localStorage.setItem('ut_role_permissions', JSON.stringify(ROLE_PERMISSIONS));
+  showToast('Role permissions saved!', 'success');
+}
+window.saveRolePermissions = saveRolePermissions;
 
 function hasPermission(action) {
   if (!currentUser) return false;
@@ -2663,6 +2760,9 @@ function renderUsers() {
     if (tbody) tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:30px;color:var(--text3)">Access denied. Admin only.</td></tr>';
     return;
   }
+  
+  renderRolePermissions();
+
   const q = (document.getElementById('user-search')?.value || '').toLowerCase();
   const tbody = document.getElementById('users-tbody');
   if (!tbody) return;
@@ -2678,6 +2778,35 @@ function renderUsers() {
     </td>
   </tr>`).join('') : '<tr><td colspan="3" style="text-align:center;padding:30px;color:var(--text3)">No users found.</td></tr>';
 }
+
+function renderRolePermissions() {
+  const tbody = document.getElementById('roles-tbody');
+  if (!tbody) return;
+  
+  const roles = Object.keys(ROLE_PERMISSIONS);
+  
+  tbody.innerHTML = roles.map(role => {
+    const p = ROLE_PERMISSIONS[role];
+    const roleName = role.charAt(0).toUpperCase() + role.slice(1);
+    
+    // Admins can't remove their own core user-management permission (safeguard)
+    const isCoreAdmin = (role === 'admin');
+    
+    return `<tr>
+      <td><strong>${roleName}</strong></td>
+      <td><input type="checkbox" onchange="updateRolePermission('${role}', 'canManageUsers', this.checked)" ${p.canManageUsers ? 'checked' : ''} ${isCoreAdmin ? 'disabled' : ''}></td>
+      <td><input type="checkbox" onchange="updateRolePermission('${role}', 'canManageEmployees', this.checked)" ${p.canManageEmployees ? 'checked' : ''}></td>
+      <td><input type="checkbox" onchange="updateRolePermission('${role}', 'canDeleteTransactions', this.checked)" ${p.canDeleteTransactions ? 'checked' : ''}></td>
+      <td><input type="checkbox" onchange="updateRolePermission('${role}', 'canExportData', this.checked)" ${p.canExportData ? 'checked' : ''}></td>
+    </tr>`;
+  }).join('');
+}
+
+window.updateRolePermission = (role, perm, val) => {
+  if (ROLE_PERMISSIONS[role]) {
+    ROLE_PERMISSIONS[role][perm] = val;
+  }
+};
 
 function openUserModal(idx) {
   if (!canManageUsers()) { showToast('Access denied.', 'error'); return; }
@@ -2828,267 +2957,6 @@ function replayBarcodeHistory(sortedTxns) {
   }
 
   return { finalState: state, stepsToInject };
-}
-
-async function runSmartCleanup() {
-  if (!canManageUsers()) { showToast('Access denied — Admin only.', 'error'); return; }
-
-  const btn = document.getElementById('smart-cleanup-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Analysing…'; }
-
-  showToast('Analysing database…', 'info');
-
-  try {
-    // ── PHASE 1: Pull latest from Supabase first ────────────────
-    const sb = getSupabase();
-    if (sb) {
-      try { await CloudSync.pullAll(true); } catch(_) {}
-    }
-
-    const allTxns = [...DB_MEMORY.transactions];
-
-    // ── PHASE 2: Deduplicate ────────────────────────────────────
-    // Sort oldest → newest so we keep the first occurrence
-    const sorted = [...allTxns].sort((a, b) => {
-      const dateComp = (a.date || '').localeCompare(b.date || '');
-      if (dateComp !== 0) return dateComp;
-      return new Date(a.createdAt) - new Date(b.createdAt);
-    });
-
-    const seenKeys = new Set();
-    const seenIds  = new Set();
-    const deduped  = [];
-    const removedDupes = [];
-
-    for (const t of sorted) {
-      const key = `${t.barcode}|${t.action}|${t.date}|${t.employeeId || ''}`;
-      if (seenKeys.has(key) || seenIds.has(t.id)) {
-        removedDupes.push(t);
-      } else {
-        seenKeys.add(key);
-        seenIds.add(t.id);
-        deduped.push(t);
-      }
-    }
-
-    // ── PHASE 3: Retroactive inference per barcode ──────────────
-    const barcodeGroups = {};
-    for (const t of deduped) {
-      if (!barcodeGroups[t.barcode]) barcodeGroups[t.barcode] = [];
-      barcodeGroups[t.barcode].push(t);
-    }
-
-    // Sort each barcode's history chronologically
-    for (const bc of Object.keys(barcodeGroups)) {
-      barcodeGroups[bc].sort((a, b) => {
-        const dc = (a.date || '').localeCompare(b.date || '');
-        return dc !== 0 ? dc : new Date(a.createdAt) - new Date(b.createdAt);
-      });
-    }
-
-    const allInjected = [];
-    const affectedBarcodes = [];
-
-    for (const [barcode, txns] of Object.entries(barcodeGroups)) {
-      // Skip barcodes where ALL steps are already inferred (no real data)
-      const realTxns = txns.filter(t => !t.inferred);
-      if (realTxns.length === 0) continue;
-
-      const { stepsToInject } = replayBarcodeHistory(txns);
-
-      if (stepsToInject.length > 0) {
-        allInjected.push(...stepsToInject);
-        affectedBarcodes.push({
-          barcode,
-          injected: stepsToInject.map(t => t.action),
-          lastRealDate: realTxns[realTxns.length - 1].date
-        });
-      }
-    }
-
-    // ── PHASE 4: Build final clean dataset ──────────────────────
-    const finalTxns = [...deduped, ...allInjected].sort((a, b) => {
-      const dc = (a.date || '').localeCompare(b.date || '');
-      return dc !== 0 ? dc : new Date(a.createdAt) - new Date(b.createdAt);
-    });
-
-    // ── PHASE 5: Show preview modal ─────────────────────────────
-    showCleanupPreview({
-      original:          allTxns.length,
-      afterDedup:        deduped.length,
-      removedDupes:      removedDupes.length,
-      injected:          allInjected.length,
-      affectedBarcodes,
-      finalTxns
-    });
-
-  } catch (e) {
-    showToast('Cleanup analysis failed: ' + e.message, 'error');
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '🧹 Smart Cleanup'; }
-  }
-}
-
-function showCleanupPreview({ original, afterDedup, removedDupes, injected, affectedBarcodes, finalTxns }) {
-  const ACTION_LABELS = {
-    received_from_cintas:    '📦 Received from Cintas',
-    distributed:             '👕 Distributed to Employee',
-    returned:                '↩ Returned from Employee',
-    collected_from_soil_bin: '🧺 Collected from Soil Bin',
-    sent_to_cintas:          '🚚 Sent to Cintas',
-    reported_issue:          '⚠ Reported Issue'
-  };
-
-  // Build affected barcodes list (show max 10)
-  const MAX_SHOW = 10;
-  const shown = affectedBarcodes.slice(0, MAX_SHOW);
-  const more  = affectedBarcodes.length - MAX_SHOW;
-
-  let barcodeRows = shown.map(b => `
-    <tr>
-      <td style="font-family:monospace;font-size:0.85rem">${escHtml(b.barcode)}</td>
-      <td style="font-size:0.8rem;color:var(--text2)">${b.injected.map(a => ACTION_LABELS[a] || a).join(' → ')}</td>
-    </tr>`).join('');
-
-  if (more > 0) {
-    barcodeRows += `<tr><td colspan="2" style="color:var(--text3);font-style:italic;font-size:0.8rem">…and ${more} more barcodes</td></tr>`;
-  }
-
-  const noChanges = removedDupes === 0 && injected === 0;
-
-  const body = `
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:20px">
-      <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:10px;padding:12px;text-align:center">
-        <div style="font-size:1.8rem;font-weight:700;color:#ef4444">${removedDupes}</div>
-        <div style="font-size:0.78rem;color:var(--text2)">Duplicate Transactions<br>to Remove</div>
-      </div>
-      <div style="background:rgba(139,92,246,0.08);border:1px solid rgba(139,92,246,0.2);border-radius:10px;padding:12px;text-align:center">
-        <div style="font-size:1.8rem;font-weight:700;color:#8b5cf6">${injected}</div>
-        <div style="font-size:0.78rem;color:var(--text2)">Missing Steps<br>to Auto-Inject</div>
-      </div>
-      <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:10px;padding:12px;text-align:center">
-        <div style="font-size:1.8rem;font-weight:700;color:#10b981">${finalTxns.length}</div>
-        <div style="font-size:0.78rem;color:var(--text2)">Clean Transactions<br>After Fix</div>
-      </div>
-    </div>
-
-    ${noChanges ? `
-      <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:10px;padding:16px;text-align:center;color:#059669">
-        ✅ Database is already clean! No duplicates or missing steps found.
-      </div>
-    ` : ''}
-
-    ${injected > 0 ? `
-      <div style="margin-bottom:16px">
-        <p style="font-size:0.84rem;color:var(--text2);margin-bottom:8px">
-          <strong>${affectedBarcodes.length} barcodes</strong> need missing workflow steps injected (e.g. items still on hold with employee but were later returned to Cintas):
-        </p>
-        <div style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:8px">
-          <table style="width:100%;border-collapse:collapse;font-size:0.82rem">
-            <thead style="position:sticky;top:0;background:var(--surface2)">
-              <tr><th style="padding:8px 12px;text-align:left">Barcode</th><th style="padding:8px 12px;text-align:left">Steps to Inject</th></tr>
-            </thead>
-            <tbody>${barcodeRows}</tbody>
-          </table>
-        </div>
-      </div>
-    ` : ''}
-
-    ${removedDupes > 0 ? `
-      <div style="background:rgba(245,158,11,0.06);border:1px solid rgba(245,158,11,0.15);border-radius:8px;padding:10px 14px;font-size:0.82rem;color:var(--text2)">
-        ⚠ <strong>${removedDupes} duplicate transactions</strong> will be permanently removed from Supabase.
-      </div>
-    ` : ''}
-
-    ${!noChanges ? `
-      <p style="font-size:0.8rem;color:var(--text3);margin-top:12px">
-        This will update Supabase directly. The cleanup cannot be undone — export a backup first if needed.
-      </p>
-    ` : ''}
-  `;
-
-  if (noChanges) {
-    confirm_dialog('✅ Database Analysis Complete', body, null, { hideConfirm: true, cancelLabel: 'Close' });
-    return;
-  }
-
-  confirm_dialog(
-    '🧹 Smart Cleanup Preview',
-    body,
-    () => applySmartCleanup(finalTxns)
-  );
-}
-
-async function applySmartCleanup(finalTxns) {
-  const btn = document.getElementById('smart-cleanup-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
-
-  showToast('Applying cleanup — please wait…', 'info');
-
-  try {
-    const sb = getSupabase();
-
-    if (sb) {
-      // Delete ALL existing transactions from Supabase, then re-insert clean set
-      // We do this in a replace strategy: delete by barcode batches
-      const barcodes = [...new Set(finalTxns.map(t => t.barcode))];
-
-      // Delete old transactions for all affected barcodes
-      for (let i = 0; i < barcodes.length; i += 100) {
-        const batch = barcodes.slice(i, i + 100);
-        const { error } = await sb.from('transactions').delete().in('barcode', batch);
-        if (error) {
-          console.error('Delete failed details:', error);
-          throw new Error('Delete failed: ' + error.message);
-        }
-      }
-
-      // Re-insert the clean transactions
-      const rows = finalTxns.map(txnToSupabase);
-      for (let i = 0; i < rows.length; i += 500) {
-        const { error } = await sb.from('transactions')
-          .insert(rows.slice(i, i + 500));
-        if (error) {
-          console.error('Re-insert failed details:', error);
-          throw new Error('Re-insert failed: ' + error.message);
-        }
-      }
-    }
-
-    // Update local memory + IndexedDB
-    DB_MEMORY.transactions = finalTxns.sort((a, b) =>
-      new Date(b.createdAt) - new Date(a.createdAt));
-    await IDB.saveTransactionsBulk(DB_MEMORY.transactions);
-
-    localStorage.setItem('ut_last_sync', new Date().toISOString());
-    showToast(`✅ Cleanup done! ${finalTxns.length} clean transactions saved to Supabase.`, 'success');
-    renderDashboard();
-    renderEmployeeList();
-
-  } catch (e) {
-    showToast('Cleanup failed: ' + e.message, 'error');
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '🧹 Smart Cleanup'; }
-  }
-}
-
-window.runSmartCleanup = runSmartCleanup;
-
-
-function clearAllData() {
-  if (!canManageUsers()) { showToast('Access denied.', 'error'); return; }
-  confirm_dialog('⚠ Clear ALL Data?', 'This will permanently delete all employees, transactions, and settings. This CANNOT be undone!', () => {
-    DB_MEMORY.employees = [];
-    DB_MEMORY.transactions = [];
-    DB_MEMORY.centres = ["Main Plant","Warehouse A","Warehouse B","Office"];
-    DB_MEMORY.uniformTypes = ["Shirt","Pants","Jacket","Safety Vest","Cap","Gloves"];
-    IDB.set('ut_employees', []);
-    IDB.clearTransactions();
-    IDB.set('ut_centres', DB_MEMORY.centres);
-    IDB.set('ut_types', DB_MEMORY.uniformTypes);
-    showToast('All data cleared.', 'success');
-    renderDashboard(); renderEmployeeList(); renderSettings();
-  });
 }
 
 // ============================================================
@@ -3371,7 +3239,7 @@ window.removeCentre = removeCentre;
 window.addUniformType = addUniformType;
 window.removeType = removeType;
 // window.cleanupDatabase = cleanupDatabase; (Replaced by Smart Cleanup)
-window.clearAllData = clearAllData;
+
 window.openExcelImport = openExcelImport;
 window.handleExcelFile = handleExcelFile;
 window.xlNext = xlNext;
@@ -3386,3 +3254,12 @@ window.closeModal = closeModal;
 window.closeModalIfBg = closeModalIfBg;
 window.openModal = openModal;
 window.confirm_dialog = confirm_dialog;
+
+// Network listeners
+window.addEventListener('online', () => {
+  updateSyncStatus();
+  CloudSync.processSyncQueue().then(() => CloudSync.pullAll(true));
+});
+window.addEventListener('offline', () => {
+  updateSyncStatus();
+});
