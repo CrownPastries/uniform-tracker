@@ -2217,10 +2217,34 @@ function updateScanFeed(txn) {
 // ============================================================
 function setReport(r) {
   currentReport = r;
+  barcodeHistoryPage = 0; // reset pagination on tab change
   document.querySelectorAll('.report-tab').forEach(t => t.classList.remove('active'));
   const tab = document.querySelector(`.report-tab[data-report="${r}"]`);
   if (tab) tab.classList.add('active');
   renderReport();
+}
+
+// ============================================================
+// BARCODE HISTORY PAGINATION STATE
+// ============================================================
+let barcodeHistoryPage = 0;
+const BARCODE_HISTORY_PAGE_SIZE = 100;
+
+// FIX 2 helper: split a barcode's transactions (ascending) into labelled cycles.
+// A new cycle starts whenever action is 'distributed' or 'received_from_cintas'
+// and there is already content in the current accumulator.
+function splitIntoCycles(txns) {
+  const cycles = [];
+  let current = [];
+  txns.forEach(t => {
+    if ((t.action === 'distributed' || t.action === 'received_from_cintas') && current.length > 0) {
+      cycles.push(current);
+      current = [];
+    }
+    current.push(t);
+  });
+  if (current.length) cycles.push(current);
+  return cycles.reverse(); // newest first
 }
 
 function renderReport() {
@@ -2233,6 +2257,12 @@ function renderReport() {
 
   const latestByBarcode = getLatestByBarcode();
 
+  // FIX 4: Pre-compute barcode → current state map once (avoids O(n²) resolveState per row)
+  const barcodeStateMap = {};
+  Object.entries(latestByBarcode).forEach(([bc, txn]) => {
+    barcodeStateMap[bc] = ACTION_TO_STATE[txn.action] || 'unknown';
+  });
+
   function inRange(dateStr) {
     if (!dateStr) return true;
     if (from && dateStr < from) return false;
@@ -2240,11 +2270,15 @@ function renderReport() {
     return true;
   }
 
-  // ---- MISSING UNIFORMS ----
+  // ---- MISSING UNIFORMS (FIX 9: always show ALL currently missing, no date gate) ----
   if (currentReport === 'missing') {
+    // Read extra filters specific to missing report
+    const centreFilter = (document.getElementById('missing-centre-filter')?.value || '');
+    const overdueOnly  = document.getElementById('missing-overdue-toggle')?.checked || false;
+
     const missingItems = [];
     Object.entries(latestByBarcode).forEach(([bc, lastTxn]) => {
-      if (lastTxn.action !== 'distributed') return;
+      if (lastTxn.action !== 'distributed') return; // only items currently out with employee
       const emp = findEmployeeByIdOrExternal(lastTxn.employeeId);
       const row = {
         barcode: bc,
@@ -2257,7 +2291,10 @@ function renderReport() {
         notes: lastTxn.notes || '',
         days: Math.floor((Date.now() - new Date(lastTxn.date)) / 86400000)
       };
-      if (!inRange(lastTxn.date)) return;
+      // FIX 9: date filter repurposed as "Distributed After" secondary filter
+      if (from && lastTxn.date < from) return;
+      if (centreFilter && row.centre !== centreFilter) return;
+      if (overdueOnly && row.days <= 7) return;
       if (q && !String(bc).toLowerCase().includes(q) &&
                !String(row.employeeName).toLowerCase().includes(q) &&
                !String(row.centre).toLowerCase().includes(q) &&
@@ -2275,14 +2312,28 @@ function renderReport() {
     });
 
     const urgentCount = missingItems.filter(r => r.days > 7).length;
+    const avgDays = missingItems.length ? Math.round(missingItems.reduce((s,r)=>s+r.days,0)/missingItems.length) : 0;
+    const allCentres = [...new Set(DB.employees.map(e=>e.productionCentre).filter(Boolean))].sort();
+
     container.innerHTML = `
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+        <select id="missing-centre-filter" class="form-input" style="flex:1;min-width:160px;max-width:220px" onchange="renderReport()">
+          <option value="">All Centres</option>
+          ${allCentres.map(c=>`<option value="${escHtml(c)}" ${centreFilter===c?'selected':''}>${escHtml(c)}</option>`).join('')}
+        </select>
+        <label style="display:flex;align-items:center;gap:6px;font-size:0.88rem;color:var(--text2);cursor:pointer">
+          <input type="checkbox" id="missing-overdue-toggle" ${overdueOnly?'checked':''} onchange="renderReport()" style="width:16px;height:16px">
+          Overdue only (&gt;7 days)
+        </label>
+        <span style="margin-left:auto;font-size:0.82rem;color:var(--text3)">Avg days out: <strong>${avgDays}d</strong></span>
+        <button class="btn-secondary" onclick="exportCSV()">Export CSV</button>
+      </div>
       <div class="missing-banner ${missingItems.length > 0 ? 'has-missing' : 'all-clear'}">
         <div class="missing-banner-icon">${missingItems.length > 0 ? '⚠' : '✓'}</div>
         <div>
           <div class="missing-banner-title">${missingItems.length > 0 ? missingItems.length + ' Uniform' + (missingItems.length !== 1 ? 's' : '') + ' Not Returned' : 'All Uniforms Returned!'}</div>
           <div class="missing-banner-sub">${missingItems.length > 0 ? urgentCount + ' item' + (urgentCount !== 1 ? 's' : '') + ' overdue >7 days' : 'No outstanding uniforms.'}</div>
         </div>
-        <button class="btn-secondary" style="margin-left:auto" onclick="exportCSV()">Export CSV</button>
       </div>
       ${Object.values(byEmp).map(grp => `
         <div class="missing-emp-group">
@@ -2296,7 +2347,7 @@ function renderReport() {
           </div>
           <div class="report-table-wrap" style="margin:0;border-top:none;border-radius:0 0 10px 10px">
             <table class="report-table">
-              <thead><tr><th>Barcode</th><th>Date Out</th><th>Days Out</th><th>Notes</th></tr></thead>
+              <thead><tr><th>Barcode</th><th>Distributed After</th><th>Days Out</th><th>Notes</th></tr></thead>
               <tbody>${grp.items.map(r => `<tr>
                 <td class="bc-mono">${escHtml(r.barcode)}</td>
                 <td>${formatDate(r.date)}</td>
@@ -2310,109 +2361,149 @@ function renderReport() {
       ${missingItems.length === 0 ? '<div class="empty-state"><p>No missing uniforms found.</p></div>' : ''}
     `;
 
-  // ---- ISSUES / DAMAGED ----
+  // ---- ISSUES / DAMAGED (FIX 5: show last employee who held each item) ----
   } else if (currentReport === 'issues') {
+    // Build barcode → all transactions map for lookups
+    const txnsByBarcode = {};
+    txns.forEach(t => { if(!txnsByBarcode[t.barcode]) txnsByBarcode[t.barcode] = []; txnsByBarcode[t.barcode].push(t); });
+
     const rows = [];
     Object.entries(latestByBarcode).forEach(([bc, last]) => {
       if (last.action !== 'reported_issue') return;
       if (!inRange(last.date)) return;
       if (q && !String(bc).toLowerCase().includes(q)) return;
-      rows.push({ barcode: bc, date: last.date, notes: last.notes || '' });
+      // FIX 5: find last employee who held this item (most recent distributed txn)
+      const bcTxns = (txnsByBarcode[bc] || []).slice().sort((a,b)=>new Date(b.date)-new Date(a.date));
+      const lastDist = bcTxns.find(t => t.action === 'distributed');
+      const lastEmpName = lastDist?.employeeName || '—';
+      rows.push({ barcode: bc, date: last.date, notes: last.notes || '', lastEmployee: lastEmpName });
     });
     container.innerHTML = `
       <div class="report-summary">
         <div class="rs-card"><div class="rs-num" style="color:var(--yellow)">${rows.length}</div><div class="rs-label">Items Damaged/Dirty</div></div>
       </div>
       <div class="report-table-wrap"><table class="report-table">
-        <thead><tr><th>Barcode</th><th>Date Reported</th><th>Notes</th></tr></thead>
+        <thead><tr><th>Barcode</th><th>Date Reported</th><th>Last Held By</th><th>Notes</th></tr></thead>
         <tbody>${rows.length ? rows.map(r => `<tr>
           <td class="bc-mono">${escHtml(r.barcode)}</td>
           <td>${formatDate(r.date)}</td>
+          <td style="color:var(--text2)">${escHtml(r.lastEmployee)}</td>
           <td>${escHtml(r.notes)}</td>
-        </tr>`).join('') : '<tr><td colspan="3" style="text-align:center;color:var(--text3);padding:30px">No issues reported.</td></tr>'}</tbody>
+        </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:30px">No issues reported.</td></tr>'}</tbody>
       </table></div>`;
 
-  // ---- CINTAS WORKFLOW ----
+  // ---- CINTAS WORKFLOW (FIX 2+10: all cycles stacked, newest first; correct date filter per cycle) ----
   } else if (currentReport === 'cintas-workflow') {
     const barcodes = [...new Set(txns.map(t => t.barcode))];
-    const workflowItems = [];
+    // Each entry: { barcode, cycleIndex, cycleLabel, ...cycle data }
+    const allCycleRows = [];
 
     barcodes.forEach(bc => {
       const allTxns = txns.filter(t => t.barcode === bc).sort((a, b) => new Date(a.date) - new Date(b.date));
       if (!allTxns.length) return;
 
-      const distributed = allTxns.find(t => t.action === 'distributed');
-      const returned = allTxns.find(t => t.action === 'returned');
-      const collected = allTxns.find(t => t.action === 'collected_from_soil_bin');
-      const sentToCintas = allTxns.find(t => t.action === 'sent_to_cintas');
-
-      if (!distributed && !sentToCintas) return;
-
-      const emp = distributed ? findEmployeeByIdOrExternal(distributed.employeeId) : null;
-      const { state } = resolveState(bc);
-
-      let status = '⚠ Incomplete';
-      let statusColor = 'var(--orange)';
-      if (distributed && (returned || collected) && sentToCintas) {
-        status = '✓ Complete'; statusColor = 'var(--green)';
-      } else if (distributed && sentToCintas && !returned && !collected) {
-        status = '⚠ At Cintas (Skipped Return)'; statusColor = 'var(--purple)';
-      } else if (distributed && (returned || collected) && !sentToCintas) {
-        status = '→ Ready for Cintas'; statusColor = 'var(--blue)';
-      } else if (distributed && !returned && !collected) {
-        status = '⏳ With Employee'; statusColor = 'var(--yellow)';
-      } else if (sentToCintas) {
-        status = '✓ At Cintas'; statusColor = 'var(--purple)';
+      if (q && !String(bc).toLowerCase().includes(q)) {
+        // Also check employee names across all txns
+        const hasEmpMatch = allTxns.some(t => t.employeeName && t.employeeName.toLowerCase().includes(q));
+        if (!hasEmpMatch) return;
       }
 
-      const hasInferred = allTxns.some(t => t.inferred);
+      const cycles = splitIntoCycles(allTxns); // newest first
+      const totalCycles = cycles.length;
 
-      if (!inRange(distributed?.date || sentToCintas?.date || '')) return;
-      if (q && !String(bc).toLowerCase().includes(q) &&
-           !(emp?.firstName && String(emp.firstName).toLowerCase().includes(q)) &&
-           !(emp?.lastName && String(emp.lastName).toLowerCase().includes(q))) return;
+      cycles.forEach((cycleTxns, idx) => {
+        const cycleNum = totalCycles - idx; // e.g. totalCycles=2 → idx0=Cycle2, idx1=Cycle1
+        const isCurrent = idx === 0;
+        const cycleLabel = totalCycles > 1
+          ? `Cycle ${cycleNum}${isCurrent ? ' — Current' : ' — Completed'}`
+          : null; // single cycle: no label needed
 
-      workflowItems.push({
-        barcode: bc, status, statusColor,
-        distributedDate: distributed?.date || '—',
-        distributedEmp: emp ? `${emp.firstName} ${emp.lastName}` : '—',
-        returnedDate: returned?.date || collected?.date || '—',
-        sentToCintasDate: sentToCintas?.date || '—',
-        isComplete: !!(distributed && (returned || collected) && sentToCintas),
-        isReadyForCintas: !!(distributed && (returned || collected) && !sentToCintas),
-        hasInferred
+        const distributed   = cycleTxns.find(t => t.action === 'distributed');
+        const returned      = cycleTxns.find(t => t.action === 'returned');
+        const collected     = cycleTxns.find(t => t.action === 'collected_from_soil_bin');
+        const sentToCintas  = cycleTxns.find(t => t.action === 'sent_to_cintas');
+        const receivedBack  = cycleTxns.find(t => t.action === 'received_from_cintas');
+
+        if (!distributed && !sentToCintas && !receivedBack) return;
+
+        // FIX 10: date filter applied to THIS cycle's earliest date, not first-ever
+        const cycleDate = distributed?.date || sentToCintas?.date || receivedBack?.date || '';
+        if (!inRange(cycleDate)) return;
+
+        const emp = distributed ? findEmployeeByIdOrExternal(distributed.employeeId) : null;
+        const hasInferred = cycleTxns.some(t => t.inferred);
+
+        // FIX 14: If returned/collected step was auto-inferred, show Auto-Processed, not Skipped Return
+        const returnWasInferred = (returned?.inferred || collected?.inferred);
+
+        let status = '⚠ Incomplete';
+        let statusColor = 'var(--orange)';
+        if (distributed && (returned || collected) && sentToCintas) {
+          status = '✓ Complete'; statusColor = 'var(--green)';
+        } else if (distributed && sentToCintas && !returned && !collected) {
+          status = returnWasInferred ? '✓ Auto-Processed' : '⚠ Skipped Return';
+          statusColor = returnWasInferred ? 'var(--green)' : 'var(--purple)';
+        } else if (distributed && (returned || collected) && !sentToCintas) {
+          status = '→ Ready for Cintas'; statusColor = 'var(--blue)';
+        } else if (distributed && !returned && !collected && !sentToCintas) {
+          status = '⏳ With Employee'; statusColor = 'var(--yellow)';
+        } else if (sentToCintas && receivedBack) {
+          status = '✓ Received Back'; statusColor = 'var(--green)';
+        } else if (sentToCintas) {
+          status = '🔄 At Cintas'; statusColor = 'var(--purple)';
+        }
+
+        const isComplete   = !!(distributed && (returned || collected) && sentToCintas);
+        const isReadyForCintas = !!(distributed && (returned || collected) && !sentToCintas);
+
+        allCycleRows.push({
+          barcode: bc, cycleLabel, isCurrent, cycleNum,
+          status, statusColor, hasInferred,
+          distributedDate: distributed?.date || '—',
+          distributedEmp: emp ? `${emp.firstName} ${emp.lastName}` : (distributed?.employeeName || '—'),
+          returnedDate: returned?.date || collected?.date || '—',
+          sentToCintasDate: sentToCintas?.date || '—',
+          receivedBackDate: receivedBack?.date || '—',
+          isComplete, isReadyForCintas
+        });
       });
     });
 
-    workflowItems.sort((a, b) => {
-      if (a.isComplete !== b.isComplete) return a.isComplete ? 1 : -1;
+    // Sort: ready for Cintas first, then incomplete, then complete; within group by barcode
+    allCycleRows.sort((a, b) => {
       if (a.isReadyForCintas !== b.isReadyForCintas) return a.isReadyForCintas ? -1 : 1;
-      return a.barcode.localeCompare(b.barcode);
+      if (a.isComplete !== b.isComplete) return a.isComplete ? 1 : -1;
+      const bc = a.barcode.localeCompare(b.barcode);
+      if (bc !== 0) return bc;
+      return b.cycleNum - a.cycleNum; // newest cycle first within same barcode
     });
 
-    const complete = workflowItems.filter(i => i.isComplete).length;
-    const readyForCintas = workflowItems.filter(i => i.isReadyForCintas).length;
-    const incomplete = workflowItems.filter(i => !i.isComplete && !i.isReadyForCintas).length;
+    const totalBarcodes = new Set(allCycleRows.map(r => r.barcode)).size;
+    const complete       = allCycleRows.filter(i => i.isComplete).length;
+    const readyForCintas = allCycleRows.filter(i => i.isReadyForCintas).length;
+    const incomplete     = allCycleRows.filter(i => !i.isComplete && !i.isReadyForCintas).length;
 
     container.innerHTML = `
       <div class="report-summary">
-        <div class="rs-card"><div class="rs-num" style="color:var(--green)">${complete}</div><div class="rs-label">Complete</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--green)">${complete}</div><div class="rs-label">Complete Cycles</div></div>
         <div class="rs-card"><div class="rs-num" style="color:var(--blue)">${readyForCintas}</div><div class="rs-label">Ready for Cintas</div></div>
         <div class="rs-card"><div class="rs-num" style="color:var(--orange)">${incomplete}</div><div class="rs-label">Incomplete</div></div>
-        <div class="rs-card"><div class="rs-num" style="color:var(--text2)">${workflowItems.length}</div><div class="rs-label">Total</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--text2)">${totalBarcodes}</div><div class="rs-label">Barcodes</div></div>
       </div>
-      <div class="report-table-wrap"><table class="report-table" style="font-size:0.9rem">
-        <thead><tr><th>Barcode</th><th>Status</th><th>Distributed</th><th>Returned</th><th>→ Cintas</th></tr></thead>
-        <tbody>${workflowItems.length ? workflowItems.map(item => `<tr class="${item.hasInferred ? 'inferred-row' : ''}" style="background:${item.status.includes('✓') ? 'rgba(34,197,94,0.05)' : item.status.includes('→') ? 'rgba(59,130,246,0.05)' : 'rgba(249,115,22,0.05)'}">
+      <div class="report-table-wrap"><table class="report-table" style="font-size:0.88rem">
+        <thead><tr><th>Barcode</th><th>Cycle</th><th>Status</th><th>Distributed</th><th>Returned</th><th>→ Cintas</th><th>← Received</th></tr></thead>
+        <tbody>${allCycleRows.length ? allCycleRows.map(item => `<tr class="${item.hasInferred ? 'inferred-row' : ''}" style="background:${item.isCurrent ? (item.status.includes('✓') ? 'rgba(34,197,94,0.06)' : item.status.includes('→') ? 'rgba(59,130,246,0.06)' : 'rgba(249,115,22,0.06)') : 'transparent'}">
           <td class="bc-mono"><strong>${escHtml(item.barcode)}</strong></td>
-          <td><span class="report-badge" style="background:${item.statusColor}; color:white; padding:4px 8px; border-radius:4px; font-size:0.85rem">${item.status}</span></td>
-          <td><small>${formatDate(item.distributedDate)}<br><em style="color:var(--text3)">${escHtml(item.distributedEmp)}</em></small></td>
-          <td><small>${item.returnedDate === '—' ? '<em style="color:var(--text3)">Pending...</em>' : formatDate(item.returnedDate)}</small></td>
-          <td><small>${item.sentToCintasDate === '—' ? '<em style="color:var(--text3)">Pending...</em>' : formatDate(item.sentToCintasDate)}</small></td>
-        </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:30px">No workflow data.</td></tr>'}</tbody>
+          <td style="white-space:nowrap;font-size:0.78rem;color:${item.isCurrent?'var(--text2)':'var(--text3)'}">${item.cycleLabel ? escHtml(item.cycleLabel) : '<em style="color:var(--text3)">—</em>'}</td>
+          <td><span class="report-badge" style="background:${item.statusColor}; color:white; padding:3px 7px; border-radius:4px; font-size:0.82rem;white-space:nowrap">${item.status}</span></td>
+          <td><small>${item.distributedDate === '—' ? '<em style="color:var(--text3)">—</em>' : formatDate(item.distributedDate)}<br><em style="color:var(--text3);font-size:0.75rem">${escHtml(item.distributedEmp)}</em></small></td>
+          <td><small>${item.returnedDate === '—' ? '<em style="color:var(--text3)">Pending…</em>' : formatDate(item.returnedDate)}</small></td>
+          <td><small>${item.sentToCintasDate === '—' ? '<em style="color:var(--text3)">Pending…</em>' : formatDate(item.sentToCintasDate)}</small></td>
+          <td><small>${item.receivedBackDate === '—' ? '<em style="color:var(--text3)">—</em>' : formatDate(item.receivedBackDate)}</small></td>
+        </tr>`).join('') : '<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:30px">No workflow data.</td></tr>'}</tbody>
       </table></div>`;
 
-  // ---- BY EMPLOYEE ----
+  // ---- BY EMPLOYEE (FIX 6: renamed "Total"→"Ever Handled"; sort by holding desc; dept column) ----
   } else if (currentReport === 'employee-summary') {
     const empList = employees.filter(e => !q || `${e.firstName} ${e.lastName}`.toLowerCase().includes(q) || String(e.employeeId||'').toLowerCase().includes(q));
     const rows = empList.map(e => {
@@ -2425,45 +2516,49 @@ function renderReport() {
       return { e, held, total: myBarcodes.length };
     }).filter(r => r.total > 0 || !q);
 
+    // FIX 6: sort by currently holding (most burdened employees first)
+    rows.sort((a, b) => b.held - a.held || b.total - a.total);
+
     container.innerHTML = `
       <div class="report-summary">
         <div class="rs-card"><div class="rs-num">${employees.length}</div><div class="rs-label">Total Employees</div></div>
         <div class="rs-card"><div class="rs-num" style="color:var(--orange)">${rows.reduce((a,r)=>a+r.held,0)}</div><div class="rs-label">Currently Out</div></div>
       </div>
       <div class="report-table-wrap"><table class="report-table">
-        <thead><tr><th>Employee</th><th>ID</th><th>Centre</th><th>Holding</th><th>Total</th></tr></thead>
+        <thead><tr><th>Employee</th><th>ID</th><th>Centre</th><th>Dept</th><th>Holding ↓</th><th>Ever Handled</th></tr></thead>
         <tbody>${rows.length ? rows.map(r => `<tr>
           <td>${escHtml(r.e.firstName)} ${escHtml(r.e.lastName)}</td>
           <td class="bc-mono">${escHtml(r.e.employeeId||'—')}</td>
           <td>${escHtml(r.e.productionCentre||'—')}</td>
-          <td><strong style="color:var(--orange)">${r.held}</strong></td>
-          <td>${r.total}</td>
-        </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:30px">No data.</td></tr>'}</tbody>
+          <td style="color:var(--text3)">${escHtml(r.e.department||'—')}</td>
+          <td><strong style="color:${r.held>0?'var(--orange)':'var(--text3)'}">${r.held}</strong></td>
+          <td style="color:var(--text3)">${r.total}</td>
+        </tr>`).join('') : '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:30px">No data.</td></tr>'}</tbody>
       </table></div>`;
 
-  // ---- AT CINTAS ----
+  // ---- AT CINTAS (FIX 3: only sent_to_cintas; removed incorrect reported_issue inclusion) ----
   } else if (currentReport === 'cintas') {
     const rows = [];
     Object.entries(latestByBarcode).forEach(([bc, last]) => {
-      if (last.action !== 'sent_to_cintas' && last.action !== 'reported_issue') return;
+      if (last.action !== 'sent_to_cintas') return; // FIX 3: damaged items excluded
       if (!inRange(last.date)) return;
       if (q && !String(bc).toLowerCase().includes(q)) return;
-      rows.push({ barcode: bc, date: last.date, how: last.action, days: Math.floor((Date.now()-new Date(last.date))/86400000), notes: last.notes||'' });
+      rows.push({ barcode: bc, date: last.date, days: Math.floor((Date.now()-new Date(last.date))/86400000), notes: last.notes||'' });
     });
+    const longStay = rows.filter(r=>r.days>14).length;
     container.innerHTML = `
       <div class="report-summary">
         <div class="rs-card"><div class="rs-num" style="color:var(--purple)">${rows.length}</div><div class="rs-label">At Cintas</div></div>
-        <div class="rs-card"><div class="rs-num" style="color:var(--yellow)">${rows.filter(r=>r.how==='reported_issue').length}</div><div class="rs-label">Reported Issues</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--red)">${longStay}</div><div class="rs-label">&gt;14 Days at Cintas</div></div>
       </div>
       <div class="report-table-wrap"><table class="report-table">
-        <thead><tr><th>Barcode</th><th>Reason</th><th>Date</th><th>Days</th><th>Notes</th></tr></thead>
+        <thead><tr><th>Barcode</th><th>Date Sent</th><th>Days at Cintas</th><th>Notes</th></tr></thead>
         <tbody>${rows.length ? rows.map(r => `<tr>
           <td class="bc-mono">${escHtml(r.barcode)}</td>
-          <td><span class="report-badge ${r.how==='reported_issue'?'issue':'cintas'}">${r.how==='reported_issue'?'Issue/Damaged':'Sent for Cleaning'}</span></td>
           <td>${formatDate(r.date)}</td>
-          <td><span style="color:${r.days>14?'var(--red)':'var(--text2)'}">${r.days}d</span></td>
+          <td><span style="color:${r.days>14?'var(--red)':r.days>7?'var(--orange)':'var(--text2)'}">${r.days}d</span></td>
           <td>${escHtml(r.notes)}</td>
-        </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:30px">No uniforms at Cintas.</td></tr>'}</tbody>
+        </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:30px">No uniforms at Cintas.</td></tr>'}</tbody>
       </table></div>`;
 
   // ---- WAREHOUSE ----
@@ -2494,20 +2589,25 @@ function renderReport() {
         </tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:30px">No uniforms in warehouse.</td></tr>'}</tbody>
       </table></div>`;
 
-  // ---- ACTIVITY SUMMARY ----
+  // ---- ACTIVITY SUMMARY (FIX 7+8: real vs inferred split; daily table respects date range) ----
   } else if (currentReport === 'activity-summary') {
     const filteredTxns = txns.filter(t => inRange(t.date));
+    const realTxns     = filteredTxns.filter(t => !t.inferred);
+    const inferredCount = filteredTxns.length - realTxns.length;
     const stats = {
-      totalScans: filteredTxns.length,
+      totalScans: realTxns.length, // FIX 8: real scans only
       uniqueBarcodes: new Set(filteredTxns.map(t => t.barcode)).size,
       uniqueEmployees: new Set(filteredTxns.filter(t => t.employeeId).map(t => t.employeeId)).size,
       byAction: {},
+      byActionInferred: {},
       byDate: {},
       byEmployee: {},
       byCentre: {}
     };
 
-    filteredTxns.forEach(t => { stats.byAction[t.action] = (stats.byAction[t.action] || 0) + 1; });
+    realTxns.forEach(t => { stats.byAction[t.action] = (stats.byAction[t.action] || 0) + 1; });
+    filteredTxns.filter(t => t.inferred).forEach(t => { stats.byActionInferred[t.action] = (stats.byActionInferred[t.action] || 0) + 1; });
+    // FIX 7: daily table uses ALL filtered txns (respects date range)
     filteredTxns.forEach(t => { stats.byDate[t.date] = (stats.byDate[t.date] || 0) + 1; });
     filteredTxns.filter(t => t.employeeId).forEach(t => {
       const emp = findEmployeeByIdOrExternal(t.employeeId);
@@ -2520,30 +2620,35 @@ function renderReport() {
       stats.byCentre[centre] = (stats.byCentre[centre] || 0) + 1;
     });
 
-    const topEmployees = Object.entries(stats.byEmployee).sort((a,b) => b[1] - a[1]).slice(0, 10);
-    const topCentres = Object.entries(stats.byCentre).sort((a,b) => b[1] - a[1]).slice(0, 10);
-    const dailyActivity = Object.entries(stats.byDate).sort((a,b) => a[0].localeCompare(b[0]));
-    const inferredCount = filteredTxns.filter(t => t.inferred).length;
+    const topEmployees  = Object.entries(stats.byEmployee).sort((a,b) => b[1] - a[1]).slice(0, 10);
+    const topCentres    = Object.entries(stats.byCentre).sort((a,b) => b[1] - a[1]).slice(0, 10);
+    // FIX 7: show all days in date range (up to 60), sorted ascending
+    const dailyActivity = Object.entries(stats.byDate).sort((a,b) => a[0].localeCompare(b[0])).slice(-60);
+    const allActions    = [...new Set([...Object.keys(stats.byAction), ...Object.keys(stats.byActionInferred)])];
+    const totalForPct   = realTxns.length || 1;
 
     container.innerHTML = `
       <div class="report-summary" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr))">
-        <div class="rs-card"><div class="rs-num" style="color:var(--blue)">${stats.totalScans}</div><div class="rs-label">Total Scans</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--blue)">${stats.totalScans}</div><div class="rs-label">Real Scans</div><div style="font-size:0.72rem;color:var(--text3);margin-top:3px">+${inferredCount} auto-inferred</div></div>
         <div class="rs-card"><div class="rs-num" style="color:var(--green)">${stats.uniqueBarcodes}</div><div class="rs-label">Unique Barcodes</div></div>
         <div class="rs-card"><div class="rs-num" style="color:var(--orange)">${stats.uniqueEmployees}</div><div class="rs-label">Active Employees</div></div>
-        <div class="rs-card"><div class="rs-num" style="color:var(--purple)">${inferredCount}</div><div class="rs-label">Auto-Inferred</div></div>
+        <div class="rs-card"><div class="rs-num" style="color:var(--purple)">${inferredCount}</div><div class="rs-label">Auto-Inferred Steps</div></div>
       </div>
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin:20px 0">
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin:20px 0; flex-wrap:wrap">
         <div class="card">
           <div class="card-header"><h3 class="card-title">Scans by Action</h3></div>
           <div class="report-table-wrap" style="max-height:300px"><table class="report-table">
-            <thead><tr><th>Action</th><th>Count</th><th>%</th></tr></thead>
-            <tbody>${Object.entries(stats.byAction).sort((a,b) => b[1] - a[1]).map(([action, count]) => `
-              <tr>
+            <thead><tr><th>Action</th><th>Real</th><th>Auto</th><th>%</th></tr></thead>
+            <tbody>${allActions.sort((a,b)=>(stats.byAction[b]||0)-(stats.byAction[a]||0)).map(action => {
+              const real = stats.byAction[action] || 0;
+              const auto = stats.byActionInferred[action] || 0;
+              return `<tr>
                 <td><span class="report-badge ${action==='distributed'?'out':action==='returned'?'returned':action==='reported_issue'?'issue':action==='sent_to_cintas'?'cintas':'warehouse'}">${actionLabel(action)}</span></td>
-                <td>${count}</td>
-                <td>${((count/stats.totalScans)*100).toFixed(1)}%</td>
-              </tr>
-            `).join('')}</tbody>
+                <td>${real}</td>
+                <td style="color:var(--text3);font-size:0.82rem">${auto > 0 ? auto : '—'}</td>
+                <td>${((real/totalForPct)*100).toFixed(1)}%</td>
+              </tr>`;
+            }).join('')}</tbody>
           </table></div>
         </div>
         <div class="card">
@@ -2563,35 +2668,63 @@ function renderReport() {
           </table></div>
         </div>
         <div class="card">
-          <div class="card-header"><h3 class="card-title">Daily Activity</h3></div>
+          <div class="card-header"><h3 class="card-title">Daily Activity${dailyActivity.length === 60 ? ' (last 60 days)' : ''}</h3></div>
           <div class="report-table-wrap" style="max-height:300px"><table class="report-table">
             <thead><tr><th>Date</th><th>Scans</th></tr></thead>
-            <tbody>${dailyActivity.slice(-14).map(([date, count]) => `<tr><td>${formatDate(date)}</td><td>${count}</td></tr>`).join('')}</tbody>
+            <tbody>${dailyActivity.map(([date, count]) => `<tr><td>${formatDate(date)}</td><td>${count}</td></tr>`).join('')}</tbody>
           </table></div>
         </div>
       </div>
     `;
 
-  // ---- BARCODE HISTORY ----
+  // ---- BARCODE HISTORY (FIX 4: pre-computed state map + 100-row pagination) ----
   } else if (currentReport === 'barcode-history') {
     let filteredTxns = txns.filter(t => inRange(t.date));
-    if (q) filteredTxns = filteredTxns.filter(t => String(t.barcode).toLowerCase().includes(q) || String(t.employeeName||'').toLowerCase().includes(q));
-    const canDelete = canDeleteTransactions();
+    if (q) filteredTxns = filteredTxns.filter(t =>
+      String(t.barcode).toLowerCase().includes(q) ||
+      String(t.employeeName||'').toLowerCase().includes(q));
+
+    const totalRows  = filteredTxns.length;
+    const totalPages = Math.max(1, Math.ceil(totalRows / BARCODE_HISTORY_PAGE_SIZE));
+    // clamp page in case filters changed
+    if (barcodeHistoryPage >= totalPages) barcodeHistoryPage = totalPages - 1;
+    const pageStart  = barcodeHistoryPage * BARCODE_HISTORY_PAGE_SIZE;
+    const pageEnd    = Math.min(pageStart + BARCODE_HISTORY_PAGE_SIZE, totalRows);
+    const pageTxns   = filteredTxns.slice(pageStart, pageEnd);
+
+    const canDelete  = canDeleteTransactions();
+    const cols       = canDelete ? 7 : 6;
+
+    const paginationHtml = totalPages > 1 ? `
+      <div style="display:flex;align-items:center;justify-content:center;gap:10px;padding:12px;border-top:1px solid var(--border)">
+        <button class="btn-secondary" style="padding:4px 12px" ${barcodeHistoryPage===0?'disabled':''}
+          onclick="barcodeHistoryPage=Math.max(0,barcodeHistoryPage-1);renderReport()">← Prev</button>
+        <span style="font-size:0.85rem;color:var(--text2)">Page ${barcodeHistoryPage+1} of ${totalPages} &nbsp;·&nbsp; ${totalRows} rows</span>
+        <button class="btn-secondary" style="padding:4px 12px" ${barcodeHistoryPage>=totalPages-1?'disabled':''}
+          onclick="barcodeHistoryPage=Math.min(totalPages-1,barcodeHistoryPage+1);renderReport()">Next →</button>
+      </div>` : '';
+
     container.innerHTML = `
-      <div class="report-table-wrap"><table class="report-table">
-        <thead><tr><th>Date</th><th>Barcode</th><th>Action</th><th>Employee / Location</th><th>State</th><th>Notes</th>${canDelete ? '<th>Action</th>' : ''}</tr></thead>
-        <tbody>${filteredTxns.length ? filteredTxns.map(t => {
-          const stateInfo = resolveState(t.barcode);
-          return `<tr class="${t.inferred ? 'inferred-row' : ''}">
-          <td>${formatDate(t.date)}</td>
-          <td class="bc-mono">${escHtml(t.barcode)}</td>
-          <td><span class="report-badge ${t.action==='distributed'?'out':t.action==='returned'?'returned':t.action==='reported_issue'?'issue':t.action==='sent_to_cintas'?'cintas':'warehouse'}">${actionLabel(t.action)}</span></td>
-          <td>${escHtml(t.employeeName||(t.action==='reported_issue'?'Issue → Cintas':(t.action||'').includes('cintas')?'Cintas':'Warehouse'))}</td>
-          <td><span class="state-badge ${stateInfo.state}">${stateLabel(stateInfo.state)}</span></td>
-          <td>${escHtml(t.notes||'')}${t.inferred ? ' <span class="inferred-indicator">⚙ inferred</span>' : ''}</td>
-          ${canDelete ? `<td><button class="btn-text" style="color:var(--red)" onclick="deleteTransaction('${t.id}')">Delete</button></td>` : ''}
-        </tr>`;}).join('') : '<tr><td colspan="' + (canDelete ? '7' : '6') + '" style="text-align:center;color:var(--text3);padding:30px">No transactions.</td></tr>'}</tbody>
-      </table></div>`;
+      <div class="report-table-wrap">
+        <table class="report-table">
+          <thead><tr><th>Date</th><th>Barcode</th><th>Action</th><th>Employee / Location</th><th>Current State</th><th>Notes</th>${canDelete ? '<th>Del</th>' : ''}</tr></thead>
+          <tbody>${pageTxns.length ? pageTxns.map(t => {
+            // FIX 4: use pre-computed map instead of calling resolveState() per row
+            const curState = barcodeStateMap[t.barcode] || 'unknown';
+            return `<tr class="${t.inferred ? 'inferred-row' : ''}">
+              <td>${formatDate(t.date)}</td>
+              <td class="bc-mono">${escHtml(t.barcode)}</td>
+              <td><span class="report-badge ${t.action==='distributed'?'out':t.action==='returned'?'returned':t.action==='reported_issue'?'issue':t.action==='sent_to_cintas'?'cintas':'warehouse'}">${actionLabel(t.action)}</span></td>
+              <td>${escHtml(t.employeeName||(t.action==='reported_issue'?'Issue → Cintas':(t.action||'').includes('cintas')?'Cintas':'Warehouse'))}</td>
+              <td><span class="state-badge ${curState}">${stateLabel(curState)}</span></td>
+              <td>${escHtml(t.notes||'')}${t.inferred ? ' <span class="inferred-indicator">⚙ inferred</span>' : ''}</td>
+              ${canDelete ? `<td><button class="btn-text" style="color:var(--red);font-size:0.8rem" onclick="deleteTransaction('${t.id}')">Del</button></td>` : ''}
+            </tr>`;
+          }).join('') : `<tr><td colspan="${cols}" style="text-align:center;color:var(--text3);padding:30px">No transactions found.</td></tr>`}
+          </tbody>
+        </table>
+        ${paginationHtml}
+      </div>`;
   }
 }
 
@@ -2599,6 +2732,7 @@ function deleteTransaction(id) {
   if (!canDeleteTransactions()) { showToast('Access denied.', 'error'); return; }
   confirm_dialog('Delete Transaction?', 'Remove this scan record? This cannot be undone.', () => {
     DB.removeTransaction(id);
+    CloudSync.deleteTransaction(id); // FIX 1: sync deletion to Supabase (queued if offline)
     showToast('Transaction deleted.', 'success');
     renderReport();
     renderDashboard();
@@ -2668,11 +2802,7 @@ function renderSettings() {
   typeContainer.innerHTML = DB.uniformTypes.map(t =>
     `<span class="tag">${escHtml(t)}<button onclick="removeType('${escHtml(t)}')">✕</button></span>`
   ).join('');
-  // Supabase connection
-  const urlEl = document.getElementById('cloud-url');
-  const keyEl = document.getElementById('cloud-key');
-  if (urlEl) urlEl.value = CloudSync.apiUrl;
-  if (keyEl) keyEl.value = CloudSync.apiKey;
+  // Supabase connection status (FIX 15: removed dead CloudSync.apiUrl/apiKey references)
   updateSyncStatus();
 
 }
@@ -2960,6 +3090,183 @@ function replayBarcodeHistory(sortedTxns) {
 }
 
 // ============================================================
+// SMART CLEANUP ORCHESTRATOR
+// ============================================================
+// Uses replayBarcodeHistory() to find every barcode that has missing
+// intermediate steps (e.g. distributed → received_from_cintas with no
+// return/soil-bin/sent step in between) and injects the corrected records.
+//
+// Date rule (per business logic):
+//   If the gap starts from a 'with_employee' state, the inferred steps are
+//   dated 7 days after the last distribution — matching the physical cycle
+//   where uniforms are collected from employees after ~1 week.
+//   For all other gaps, we use the midpoint between the two surrounding dates.
+
+async function runSmartCleanup() {
+  if (!canDeleteTransactions()) {
+    showToast('Access denied. Admins and operators only.', 'error');
+    return;
+  }
+
+  // ── Pass 1: Dry-run to count and preview what will be fixed ──────────────
+  const barcodes = [...new Set(DB.transactions.map(t => t.barcode))];
+  let previewRows = [];
+
+  for (const bc of barcodes) {
+    const sorted = DB.transactions
+      .filter(t => t.barcode === bc)
+      .sort((a, b) => {
+        const d = (a.date || '').localeCompare(b.date || '');
+        return d !== 0 ? d : new Date(a.createdAt) - new Date(b.createdAt);
+      });
+
+    const { stepsToInject } = replayBarcodeHistory(sorted);
+    if (stepsToInject.length > 0) {
+      previewRows.push({ bc, count: stepsToInject.length, actions: stepsToInject.map(s => s.action) });
+    }
+  }
+
+  if (previewRows.length === 0) {
+    confirm_dialog(
+      '✓ Database Clean',
+      'All uniform histories are complete — no missing steps detected. The dashboard numbers are accurate.',
+      () => {},
+      { hideConfirm: true, cancelLabel: 'Close' }
+    );
+    return;
+  }
+
+  const totalFixes = previewRows.reduce((s, r) => s + r.count, 0);
+  const previewHtml = `
+    <p style="margin-bottom:12px">Found <strong>${previewRows.length} barcodes</strong> with missing flow steps.
+    This will insert <strong>${totalFixes} inferred transactions</strong> to fill the gaps,
+    using a 7-day rule for uniforms with employees.</p>
+    <div style="max-height:220px;overflow-y:auto;font-size:0.82rem;border:1px solid var(--border);border-radius:8px;padding:10px">
+      ${previewRows.slice(0, 30).map(r =>
+        `<div style="padding:4px 0;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:center">
+          <code style="font-size:0.8rem;color:var(--text2)">${escHtml(r.bc)}</code>
+          <span style="color:var(--text3)">+${r.count} step${r.count > 1 ? 's' : ''}</span>
+          <span style="color:var(--purple);font-size:0.75rem">${r.actions.map(a => actionLabel(a)).join(' → ')}</span>
+        </div>`
+      ).join('')}
+      ${previewRows.length > 30 ? `<div style="padding:4px 0;color:var(--text3)">…and ${previewRows.length - 30} more barcodes</div>` : ''}
+    </div>
+    <p style="margin-top:10px;font-size:0.8rem;color:var(--text3)">⚙ All inserted steps are marked as <em>auto-inferred</em> and will sync to Supabase.</p>`;
+
+  confirm_dialog('🔧 Smart Database Cleanup', previewHtml, async () => {
+    // ── Pass 2: Actually apply the fixes ─────────────────────────────────
+    const btn = document.getElementById('smart-cleanup-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; }
+
+    let totalInjected = 0;
+    const toSync = [];
+
+    for (const bc of barcodes) {
+      const sorted = DB.transactions
+        .filter(t => t.barcode === bc)
+        .sort((a, b) => {
+          const d = (a.date || '').localeCompare(b.date || '');
+          return d !== 0 ? d : new Date(a.createdAt) - new Date(b.createdAt);
+        });
+
+      // Custom replay with business date rule:
+      // For gaps starting from 'with_employee', date = distributionDate + 7 days
+      // For all other gaps, use midpoint
+      const ACTION_TO_ST = {
+        received_from_cintas: 'warehouse', distributed: 'with_employee',
+        returned: 'warehouse', collected_from_soil_bin: 'soil_bin',
+        sent_to_cintas: 'at_cintas', reported_issue: 'damaged'
+      };
+
+      let state = 'unknown';
+      let lastTxn = null;
+      const toInject = [];
+
+      for (const txn of sorted) {
+        if (txn.inferred) {
+          state = ACTION_TO_ST[txn.action] || state;
+          lastTxn = txn;
+          continue;
+        }
+
+        const neededMap = INFERENCE_STEPS_NEEDED[state] || {};
+        const needed = neededMap[txn.action] || [];
+
+        if (needed.length > 0) {
+          // Business date rule: if coming from with_employee state,
+          // use distribution_date + 7 days; otherwise midpoint.
+          let inferDate;
+          if (state === 'with_employee' && lastTxn) {
+            const distDate = new Date(lastTxn.date);
+            distDate.setDate(distDate.getDate() + 7);
+            // Don't exceed the next real txn's date
+            const nextDate = new Date(txn.date);
+            inferDate = distDate <= nextDate
+              ? distDate.toISOString().slice(0, 10)
+              : estimateMidDate(lastTxn.date, txn.date);
+          } else {
+            inferDate = estimateMidDate(lastTxn ? lastTxn.date : txn.date, txn.date);
+          }
+
+          for (const missingAction of needed) {
+            const inferredTxn = {
+              id:           uid(),
+              barcode:      txn.barcode,
+              action:       missingAction,
+              date:         inferDate,
+              createdAt:    new Date(inferDate + 'T12:00:00Z').toISOString(),
+              employeeId:   missingAction === 'returned' ? (lastTxn?.employeeId || null) : null,
+              employeeName: missingAction === 'returned' ? (lastTxn?.employeeName || null) : null,
+              uniformType:  txn.uniformType || lastTxn?.uniformType || '',
+              notes:        'Auto-corrected by Smart Cleanup (7-day rule)',
+              inferred:     true
+            };
+            toInject.push(inferredTxn);
+            toSync.push(inferredTxn);
+            state = ACTION_TO_ST[missingAction] || state;
+            lastTxn = inferredTxn;
+            totalInjected++;
+          }
+        }
+
+        state = ACTION_TO_ST[txn.action] || state;
+        lastTxn = txn;
+      }
+
+      // Insert all injected steps into memory + IndexedDB
+      for (const t of toInject) {
+        DB.addTransaction(t);
+      }
+    }
+
+    // Re-sort in-memory transactions (newest first by createdAt)
+    DB_MEMORY.transactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    // Push all to Supabase in one batch
+    if (toSync.length > 0) {
+      showToast(`⏳ Syncing ${toSync.length} corrected steps to Supabase…`, 'info');
+      try {
+        await CloudSync.pushTransactionsBulk(toSync);
+      } catch(e) {
+        // Queue individually if bulk fails
+        for (const t of toSync) CloudSync.pushTransaction(t);
+      }
+    }
+
+    if (btn) { btn.disabled = false; btn.innerHTML = '🔧 Fix Database'; }
+
+    // Refresh all views
+    renderDashboard();
+    if (currentPage === 'reports') renderReport();
+
+    showToast(
+      `✓ Smart Cleanup complete — ${totalInjected} missing steps added across ${previewRows.length} barcodes. Dashboard updated.`,
+      'success'
+    );
+  }, { useInnerHTML: true, confirmLabel: 'Apply Fixes', cancelLabel: 'Cancel' });
+}
+
+// ============================================================
 // MODALS & TOAST
 // ============================================================
 function openModal(id) {
@@ -3164,7 +3471,7 @@ function xlNext() {
 }
 
 function xlDoImport() {
-  let imported = 0;
+  let imported = 0, skipped = 0;
   xlRawRows.forEach(row => {
     let firstName = '', lastName = '';
     if (xlMapping._singleName) {
@@ -3177,9 +3484,19 @@ function xlDoImport() {
     }
     if (!firstName) return;
 
+    const newEmpId = xlMapping.employeeId !== undefined ? String(row[xlMapping.employeeId] || '').trim() : '';
+    // FIX 11: Skip duplicates — check by employeeId if available, else by full name
+    const isDuplicate = newEmpId
+      ? DB.employees.some(e => e.employeeId && e.employeeId === newEmpId)
+      : DB.employees.some(e =>
+          (e.firstName||'').toLowerCase() === firstName.toLowerCase() &&
+          (e.lastName||'').toLowerCase() === (lastName||'').toLowerCase()
+        );
+    if (isDuplicate) { skipped++; return; }
+
     const emp = {
       id: uid(), firstName, lastName,
-      employeeId: xlMapping.employeeId !== undefined ? String(row[xlMapping.employeeId] || '').trim() : '',
+      employeeId: newEmpId,
       productionCentre: xlMapping.productionCentre !== undefined ? String(row[xlMapping.productionCentre] || '').trim() : '',
       department: xlMapping.department !== undefined ? String(row[xlMapping.department] || '').trim() : '',
       phone: xlMapping.phone !== undefined ? String(row[xlMapping.phone] || '').trim() : '',
@@ -3192,7 +3509,10 @@ function xlDoImport() {
   });
 
   closeModal('excel-import-modal');
-  showToast(`✓ Imported ${imported} employees!`, 'success');
+  const msg = skipped > 0
+    ? `✓ Imported ${imported} employees. ${skipped} skipped (duplicates).`
+    : `✓ Imported ${imported} employees!`;
+  showToast(msg, 'success');
   renderEmployeeList();
 }
 
@@ -3232,6 +3552,23 @@ window.renderEmployeeList = renderEmployeeList;
 window.renderReport = renderReport;
 window.clearDates = clearDates;
 window.exportCSV = exportCSV;
+// Expose pagination state to inline onclick handlers
+Object.defineProperty(window, 'barcodeHistoryPage', {
+  get() { return barcodeHistoryPage; },
+  set(v) { barcodeHistoryPage = v; }
+});
+Object.defineProperty(window, 'totalPages', {
+  get() { return Math.max(1, Math.ceil(
+    (() => {
+      const from = document.getElementById('report-from')?.value || '';
+      const to   = document.getElementById('report-to')?.value || '';
+      const q    = (document.getElementById('report-search')?.value || '').toLowerCase();
+      let f = DB.transactions.filter(t => (!from || t.date >= from) && (!to || t.date <= to));
+      if (q) f = f.filter(t => String(t.barcode).toLowerCase().includes(q) || String(t.employeeName||'').toLowerCase().includes(q));
+      return f.length;
+    })()
+  ) / BARCODE_HISTORY_PAGE_SIZE); }
+});
 window.exportJSON = exportJSON;
 window.importJSON = importJSON;
 window.addCentre = addCentre;
@@ -3254,6 +3591,7 @@ window.closeModal = closeModal;
 window.closeModalIfBg = closeModalIfBg;
 window.openModal = openModal;
 window.confirm_dialog = confirm_dialog;
+window.runSmartCleanup = runSmartCleanup;
 
 // Network listeners
 window.addEventListener('online', () => {

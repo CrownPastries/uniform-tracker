@@ -323,6 +323,23 @@
             <label class="btn-secondary file-label admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Import (Admin Only)<input type="file" accept=".json" id="importFile" onchange="importJSON(event)" style="display:none" /></label>
           </div>
         </div>
+        <!-- Smart Database Cleanup Card -->
+        <div class="card" style="grid-column: 1 / -1; border:1px solid rgba(168,85,247,0.3); background:linear-gradient(135deg,rgba(168,85,247,0.06),rgba(59,130,246,0.04))">
+          <div class="card-header">
+            <h2 class="card-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px;height:20px;color:var(--purple)"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3-3a1 1 0 000-1.4l-1.6-1.6a1 1 0 00-1.4 0l-3 3z"/><path d="M20 20l-6.5-6.5"/><path d="M3.5 10.5l3-3M6.5 13.5l3-3M9.5 16.5l3-3"/></svg>
+              Fix Dashboard Numbers — Smart Cleanup
+            </h2>
+          </div>
+          <p class="card-desc">Scans every uniform's history and inserts missing flow steps (return → soil bin → sent to Cintas) using the 7-day business rule. Fixes dashboard counts for <em>With Employees</em>, <em>At Cintas</em>, and <em>In Warehouse</em>. Always shows a preview before making changes.</p>
+          <div class="settings-actions" style="margin-top:16px">
+            <button class="btn-primary" id="smart-cleanup-btn" onclick="runSmartCleanup()" style="background:linear-gradient(135deg,#7c3aed,#4f46e5)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3-3a1 1 0 000-1.4l-1.6-1.6a1 1 0 00-1.4 0l-3 3z"/><path d="M20 20l-6.5-6.5"/></svg>
+              🔧 Fix Database
+            </button>
+            <span style="font-size:0.78rem;color:var(--text3);align-self:center">Shows preview before applying · All steps synced to Supabase</span>
+          </div>
+        </div>
         <!-- Supabase Sync Card -->
         <div class="card" style="grid-column: 1 / -1">
           <div class="card-header">
